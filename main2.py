@@ -186,7 +186,7 @@ MODEL_STORE = _UserStore("MODEL_STORE")
 # AUTH — verifies the Firebase ID token the frontend already sends
 # ======================================================================
 
-_CERTS_URL = "https://www.googleapis.com/robots/v1/metadata/x509/securetoken@system.gserviceaccount.com"
+_CERTS_URL = "https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com"
 _certs_cache = {"certs": None, "expires": 0.0, "fetched": 0.0}
 _certs_lock = threading.Lock()
 
