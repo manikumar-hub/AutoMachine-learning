@@ -175,7 +175,7 @@ function aiDefaults(provider){
   gemini:{model:'gemini-2.0-flash',endpoint:'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent'},
   ollama:{model:'llama3.2',endpoint:'http://localhost:11434/v1/chat/completions'}}[provider]||{model:'',endpoint:''}
 }
-const AI_MODELS={openai:['gpt-4o-mini','gpt-4.1-mini','o4-mini'],gemini:['gemini-2.5-flash','gemini-2.5-pro','gemini-2.0-flash'],ollama:['llama3.2','qwen2.5-coder:7b','mistral']};
+const AI_MODELS={openai:['gpt-4o-mini','gpt-4.1-mini','o4-mini'],gemini:['gemini-3.8-flash','gemini-2.5-pro'],ollama:['llama3.2','qwen2.5-coder:7b','mistral']};
 function aiModelOptions(provider,selected){
  const models=AI_MODELS[provider]||[],custom=!models.includes(selected);
  return models.map(model=>`<option value="${esc(model)}" ${model===selected?'selected':''}>${esc(model)}</option>`).join('')+`<option value="__custom__" ${custom?'selected':''}>Custom model ID…</option>`;
