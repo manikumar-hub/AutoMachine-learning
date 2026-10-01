@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 import base64
 import os
+import sys
 import time
 import json
 import hmac
@@ -20,6 +21,7 @@ import secrets
 import threading
 import contextvars
 import urllib.request
+import traceback
 from collections.abc import MutableMapping
 from pathlib import Path
 from fastapi import Depends
@@ -195,9 +197,16 @@ def _firebase_certs(force=False):
         fresh = _certs_cache["certs"] and now < _certs_cache["expires"]
         if fresh and not (force and now - _certs_cache["fetched"] > 60):   # forced refresh at most 1/min
             return _certs_cache["certs"]
-        with urllib.request.urlopen(_CERTS_URL, timeout=10) as resp:
-            certs = json.loads(resp.read().decode())
-            match = re.search(r"max-age=(\d+)", resp.headers.get("Cache-Control", ""))
+        try:
+            with urllib.request.urlopen(_CERTS_URL, timeout=15) as resp:
+                certs = json.loads(resp.read().decode())
+                match = re.search(r"max-age=(\d+)", resp.headers.get("Cache-Control", ""))
+        except Exception:
+            print("AUTH ERROR: could not download Google's Firebase certificates:", file=sys.stderr)
+            traceback.print_exc()
+            if _certs_cache["certs"]:          # keep working with the last known certificates
+                return _certs_cache["certs"]
+            raise
         max_age = int(match.group(1)) if match else 3600
         _certs_cache.update(certs=certs, fetched=now, expires=now + max(300, min(max_age, 21600)))
         return certs
@@ -233,7 +242,9 @@ async def _bind_user(request: Request):
             uid = await run_in_threadpool(_verify_firebase_token, token.strip())
         except ValueError:
             raise HTTPException(401, "Your session expired. Please sign in again.")
-        except Exception:
+        except Exception as exc:
+            print(f"AUTH ERROR (503): {type(exc).__name__}: {exc}", file=sys.stderr)
+            traceback.print_exc()
             raise HTTPException(503, "Could not verify your sign-in right now. Please try again.")
     _current_state.set(_get_state(uid))
 
@@ -282,6 +293,28 @@ if CORS_ORIGINS:   # same-origin deployment needs no CORS; set CORS_ORIGINS only
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
+
+
+@app.get("/healthz/auth")
+def healthz_auth():
+    """Open this URL in the browser to see why sign-in verification fails (no secrets are shown)."""
+    out = {"require_auth": REQUIRE_AUTH, "firebase_project_id": FIREBASE_PROJECT_ID}
+    try:
+        import google.auth  # noqa: F401
+        from google.auth import jwt as _jwt  # noqa: F401
+        out["google_auth_installed"] = True
+    except Exception as exc:
+        out["google_auth_installed"] = f"NO - {type(exc).__name__}: {exc}"
+    try:
+        import cryptography  # noqa: F401
+        out["cryptography_installed"] = True
+    except Exception as exc:
+        out["cryptography_installed"] = f"NO - {type(exc).__name__}: {exc}"
+    try:
+        out["certificates"] = f"ok ({len(_firebase_certs())} keys)"
+    except Exception as exc:
+        out["certificates"] = f"FAILED - {type(exc).__name__}: {exc}"
+    return out
 
 
 # ======================================================================
@@ -1211,6 +1244,3 @@ def predict(request: PredictRequest):
         }
 
     return result
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
