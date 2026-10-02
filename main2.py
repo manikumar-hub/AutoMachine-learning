@@ -936,6 +936,361 @@ def _train_models_impl():
 
 
 # ======================================================================
+# CLUSTERING — unsupervised learning, no target column needed
+# ======================================================================
+
+import warnings
+import numpy as np
+from scipy.cluster.hierarchy import linkage, fcluster
+from sklearn.cluster import KMeans, DBSCAN, Birch
+from sklearn.decomposition import PCA
+from sklearn.mixture import GaussianMixture
+from sklearn.neighbors import NearestNeighbors
+from sklearn.metrics import (
+    silhouette_score, davies_bouldin_score, calinski_harabasz_score, pairwise_distances_argmin,
+)
+
+CLUSTER_MAX_ROWS = int(os.getenv("CLUSTER_MAX_ROWS", "3000"))
+CLUSTER_TIME_BUDGET = int(os.getenv("CLUSTER_TIME_BUDGET_SECONDS", "90"))
+CLUSTER_ALGOS = ["KMeans", "GaussianMixture", "Agglomerative", "Birch", "DBSCAN"]
+
+
+class ClusterRequest(BaseModel):
+    features: Optional[List[str]] = None
+    algorithms: Optional[List[str]] = None
+    k_min: int = 2
+    k_max: int = 8
+
+
+class ClusterPredictRequest(BaseModel):
+    values: Dict[str, Any]
+
+
+def _prep_cluster_frame(df, cols, numeric=None):
+    """Copy of the chosen columns with numeric-looking text converted to numbers."""
+    work = df[cols].copy()
+    for c in cols:
+        if numeric is not None:
+            if c in numeric:
+                work[c] = pd.to_numeric(work[c], errors="coerce")
+        elif not _is_numeric(work[c]) and (
+            pd.api.types.is_object_dtype(work[c]) or pd.api.types.is_string_dtype(work[c])
+        ):
+            converted, ok = try_convert_numeric(work[c])
+            if ok:
+                work[c] = converted
+    return work
+
+
+def _cluster_columns(df, requested):
+    if requested:
+        cols, unknown = _resolve_columns(df, requested)
+        if unknown:
+            raise HTTPException(400, f"Columns not found: {unknown}. Available: {df.columns.tolist()}")
+    else:
+        cols = list(df.columns)
+    probe = _prep_cluster_frame(df, cols)
+    n = max(len(df), 1)
+    keep, skipped = [], {}
+    for c in cols:
+        s = probe[c]
+        unique = int(s.nunique(dropna=True))
+        if unique <= 1:
+            skipped[c] = "constant"
+        elif s.isnull().mean() > 0.6:
+            skipped[c] = "mostly missing"
+        elif not _is_numeric(s) and (unique > 30 or unique / n > 0.95):
+            skipped[c] = "too many distinct values (ID or free text)"
+        else:
+            keep.append(c)
+    if not keep:
+        raise HTTPException(400, "None of the selected columns can be used for clustering.")
+    return keep, skipped
+
+
+def _cluster_preprocessor(work):
+    numeric = work.select_dtypes(include=["number"]).columns.tolist()
+    categorical = [c for c in work.columns if c not in numeric]
+    pre = ColumnTransformer(
+        transformers=[
+            ("num", Pipeline([("imp", SimpleImputer(strategy="median")), ("sc", StandardScaler())]), numeric),
+            ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")),
+                              ("enc", OneHotEncoder(handle_unknown="ignore", sparse_output=False))]), categorical),
+        ],
+        remainder="drop",
+    )
+    return pre, numeric, categorical
+
+
+def _cluster_metrics(X, labels):
+    mask = labels != -1
+    found = np.unique(labels[mask])
+    if len(found) < 2 or mask.sum() <= len(found):
+        return None
+    Xm, lm = X[mask], labels[mask]
+    return {
+        "silhouette": round(float(silhouette_score(Xm, lm)), 4),
+        "davies_bouldin": round(float(davies_bouldin_score(Xm, lm)), 4),
+        "calinski_harabasz": round(float(calinski_harabasz_score(Xm, lm)), 1),
+    }
+
+
+def _cluster_candidates(algo, X, ks, deadline):
+    """Yields (k or None, parameter text, labels, inertia or None)."""
+    if algo == "KMeans":
+        for k in ks:
+            if time.time() > deadline:
+                return
+            km = KMeans(n_clusters=k, n_init=10, random_state=42).fit(X)
+            yield k, f"k={k}", km.labels_, float(km.inertia_)
+    elif algo == "GaussianMixture":
+        cov = "full" if X.shape[1] <= 15 else "diag"
+        for k in ks:
+            if time.time() > deadline:
+                return
+            gm = GaussianMixture(n_components=k, covariance_type=cov, random_state=42).fit(X)
+            yield k, f"k={k}", gm.predict(X), None
+    elif algo == "Agglomerative":
+        tree = linkage(X, method="ward")
+        for k in ks:
+            if time.time() > deadline:
+                return
+            yield k, f"k={k}", fcluster(tree, k, criterion="maxclust") - 1, None
+    elif algo == "Birch":
+        for k in ks:
+            if time.time() > deadline:
+                return
+            yield k, f"k={k}", Birch(n_clusters=k).fit_predict(X), None
+    elif algo == "DBSCAN":
+        min_samples = max(5, min(2 * X.shape[1], 20))
+        if len(X) <= min_samples:
+            return
+        dist = NearestNeighbors(n_neighbors=min_samples).fit(X).kneighbors(X)[0][:, -1]
+        for q in (0.85, 0.9, 0.95, 0.98):
+            if time.time() > deadline:
+                return
+            eps = float(np.quantile(dist, q))
+            if eps <= 0:
+                continue
+            yield None, f"eps={eps:.2f}", DBSCAN(eps=eps, min_samples=min_samples).fit_predict(X), None
+
+
+def _relabel_by_size(labels):
+    ids, counts = np.unique(labels[labels != -1], return_counts=True)
+    mapping = {int(old): new for new, old in enumerate(ids[np.argsort(-counts, kind="stable")])}
+    return np.array([mapping.get(int(l), -1) for l in labels])
+
+
+def _cluster_profiles(work, labels, numeric, categorical):
+    profiles = []
+    mean_all = work[numeric].mean() if numeric else None
+    std_all = work[numeric].std().replace(0, np.nan) if numeric else None
+    share_all = {c: work[c].astype(str).value_counts(normalize=True) for c in categorical}
+    for cid in sorted(set(labels.tolist())):
+        mask = labels == cid
+        sub = work[mask]
+        scored = []
+        for col in numeric:
+            sd = std_all[col]
+            if pd.isna(sd):
+                continue
+            z = (sub[col].mean() - mean_all[col]) / sd
+            if pd.notna(z):
+                scored.append((abs(float(z)), float(z), col))
+        traits = [
+            f"{col}: {'higher' if z > 0 else 'lower'} than average ({z:+.1f} std)"
+            for _, z, col in sorted(scored, reverse=True)[:3] if abs(z) >= 0.3
+        ]
+        for col in categorical:
+            vc = sub[col].astype(str).value_counts(normalize=True)
+            if len(vc) and vc.iloc[0] >= 0.5 and vc.iloc[0] >= 1.3 * share_all[col].get(vc.index[0], 1.0):
+                traits.append(f"{col}: mostly {vc.index[0]} ({vc.iloc[0] * 100:.0f}%)")
+        profiles.append({
+            "cluster": int(cid),
+            "name": "Noise / outliers" if cid == -1 else f"Cluster {cid}",
+            "size": int(mask.sum()),
+            "share_pct": round(float(mask.mean()) * 100, 1),
+            "traits": traits[:5],
+            "means": {col: round(float(sub[col].mean()), 3) for col in numeric[:12]},
+        })
+    return profiles
+
+
+def _json_safe(obj):
+    """NaN / inf are not valid JSON: turn them into null before sending."""
+    if isinstance(obj, float):
+        return obj if np.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
+def _cluster_quality(sil):
+    if sil >= 0.5:
+        return "clear structure"
+    if sil >= 0.25:
+        return "moderate structure"
+    return "weak / overlapping groups"
+
+
+def _cluster_impl(request: ClusterRequest):
+    df = _require_df()
+    algos = request.algorithms or CLUSTER_ALGOS
+    bad = [a for a in algos if a not in CLUSTER_ALGOS]
+    if bad:
+        raise HTTPException(400, f"Unknown algorithm(s): {bad}. Choose from {CLUSTER_ALGOS}.")
+    if request.k_min < 2 or request.k_max < request.k_min or request.k_max > 12:
+        raise HTTPException(400, "Use 2 <= k_min <= k_max <= 12.")
+
+    cols, skipped = _cluster_columns(df, request.features)
+    work_all = _prep_cluster_frame(df, cols)
+    sampled = len(work_all) > CLUSTER_MAX_ROWS
+    work = work_all.sample(CLUSTER_MAX_ROWS, random_state=42) if sampled else work_all
+    if len(work) < 10:
+        raise HTTPException(400, "Need at least 10 rows to find clusters.")
+    ks = list(range(request.k_min, min(request.k_max, len(work) - 1) + 1))
+
+    pre, numeric, categorical = _cluster_preprocessor(work)
+    X = np.asarray(pre.fit_transform(work), dtype=float)
+    deadline = time.time() + CLUSTER_TIME_BUDGET
+
+    results, curves, kept_labels = [], {}, {}
+    for algo in algos:
+        if time.time() > deadline:
+            results.append({"algorithm": algo, "error": "Skipped: time limit reached"})
+            continue
+        best, curve = None, []
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                for k, param, labels, inertia in _cluster_candidates(algo, X, ks, deadline):
+                    labels = np.asarray(labels)
+                    metrics = _cluster_metrics(X, labels)
+                    noise = float((labels == -1).mean())
+                    if metrics is None or (algo == "DBSCAN" and (noise > 0.3 or len(np.unique(labels[labels >= 0])) > request.k_max)):
+                        continue
+                    # noise points are ignored by silhouette, so penalise them or DBSCAN would win unfairly
+                    adjusted = metrics["silhouette"] * (1 - noise)
+                    if k is not None:
+                        curve.append({"k": int(k), "silhouette": metrics["silhouette"],
+                                      "inertia": None if inertia is None else round(inertia, 2)})
+                    if best is None or adjusted > best["score"]:
+                        best = {**metrics, "param": param, "labels": labels, "score": adjusted, "noise_pct": round(noise * 100, 1)}
+        except Exception as exc:
+            results.append({"algorithm": algo, "error": str(exc)[:200]})
+            continue
+        if best is None:
+            results.append({"algorithm": algo, "error": "No meaningful clustering found"})
+            continue
+        labels = _relabel_by_size(best["labels"])
+        sizes = np.bincount(labels[labels >= 0]).tolist()
+        kept_labels[algo] = labels
+        curves[algo] = curve
+        results.append({
+            "algorithm": algo, "param": best["param"], "n_clusters": len(sizes),
+            "silhouette": best["silhouette"], "davies_bouldin": best["davies_bouldin"],
+            "calinski_harabasz": best["calinski_harabasz"], "noise_pct": best["noise_pct"], "sizes": sizes,
+            "score": round(best["score"], 4),
+        })
+
+    ok = [r for r in results if "silhouette" in r]
+    if not ok:
+        raise HTTPException(400, "No meaningful clusters found. Try other columns or a wider cluster range.")
+    top = max(ok, key=lambda r: r["score"])
+    labels = kept_labels[top["algorithm"]]
+
+    centroids = np.vstack([X[labels == c].mean(axis=0) for c in range(top["n_clusters"])])
+    profiles = _cluster_profiles(work, labels, numeric, categorical)
+
+    if X.shape[1] >= 2:
+        pca = PCA(n_components=2, random_state=42)
+        coords = pca.fit_transform(X)
+        explained = [round(float(v), 3) for v in pca.explained_variance_ratio_]
+    else:
+        coords, explained = np.column_stack([X[:, 0], np.zeros(len(X))]), [1.0, 0.0]
+    pick = np.random.RandomState(42).permutation(len(X))[:1200]
+    points = [{"x": round(float(coords[i, 0]), 3), "y": round(float(coords[i, 1]), 3), "c": int(labels[i])} for i in pick]
+
+    schema = []
+    for c in cols:
+        if c in numeric:
+            schema.append({"name": c, "type": "numeric", "example": round(float(work[c].median()), 3)})
+        else:
+            top_values = work[c].astype(str).value_counts().index[:8].tolist()
+            schema.append({"name": c, "type": "categorical", "example": top_values[0] if top_values else "", "choices": top_values})
+
+    DATASET["cluster_run"] = {
+        "pre": pre, "cols": cols, "numeric": numeric, "categorical": categorical,
+        "centroids": centroids, "profiles": {p["cluster"]: p for p in profiles},
+    }
+    return _json_safe({
+        "rows_total": int(len(df)), "rows_used": int(len(work)), "sampled": sampled,
+        "features_used": cols, "skipped_columns": skipped,
+        "algorithms": results, "curves": curves,
+        "best": {**top, "quality": _cluster_quality(top["silhouette"])},
+        "profiles": profiles, "pca": {"points": points, "explained": explained},
+        "schema": schema, "truncated": time.time() > deadline,
+    })
+
+
+@app.post("/api/cluster")
+def run_clustering(request: ClusterRequest):
+    if not _TRAIN_SLOTS.acquire(blocking=False):
+        raise HTTPException(429, "Server is busy running other models. Please try again in a minute.")
+    try:
+        return _cluster_impl(request)
+    finally:
+        _TRAIN_SLOTS.release()
+
+
+def _require_cluster_run():
+    run = DATASET.get("cluster_run")
+    if not run:
+        raise HTTPException(400, "Run clustering first.")
+    return run
+
+
+@app.post("/api/cluster/predict")
+def cluster_predict(request: ClusterPredictRequest):
+    run = _require_cluster_run()
+    frame = pd.DataFrame([{c: request.values.get(c) for c in run["cols"]}])
+    for c in run["numeric"]:
+        frame[c] = pd.to_numeric(frame[c], errors="coerce")
+    for c in run["categorical"]:
+        frame[c] = frame[c].where(frame[c].astype(str).str.strip().ne("") & frame[c].notna(), np.nan)
+    X = run["pre"].transform(frame)
+    cid = int(pairwise_distances_argmin(X, run["centroids"])[0])
+    profile = run["profiles"].get(cid, {})
+    return {"cluster": cid, "name": profile.get("name", f"Cluster {cid}"),
+            "traits": profile.get("traits", []), "share_pct": profile.get("share_pct")}
+
+
+@app.get("/api/cluster/download")
+def cluster_download():
+    run = _require_cluster_run()
+    df = _require_df()
+    missing = [c for c in run["cols"] if c not in df.columns]
+    if missing:
+        raise HTTPException(400, f"These clustered columns are no longer in the dataset: {missing}")
+    work = _prep_cluster_frame(df, run["cols"], numeric=set(run["numeric"]))
+    step = 50000   # transform in chunks so big files do not use much memory
+    labels = np.concatenate([
+        pairwise_distances_argmin(run["pre"].transform(work.iloc[i:i + step]), run["centroids"])
+        for i in range(0, len(work), step)
+    ])
+    out = df.copy()
+    name = "cluster"
+    while name in out.columns:
+        name += "_"
+    out[name] = labels
+    buf = io.BytesIO(out.to_csv(index=False).encode("utf-8"))
+    return StreamingResponse(buf, media_type="text/csv",
+                             headers={"Content-Disposition": 'attachment; filename="clustered_data.csv"'})
+
+
+# ======================================================================
 # DATA ANALYTICS — matplotlib + seaborn charts on the currently uploaded dataset
 # ======================================================================
 
