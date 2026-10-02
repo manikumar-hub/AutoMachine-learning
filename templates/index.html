@@ -175,7 +175,7 @@ function aiDefaults(provider){
   gemini:{model:'gemini-2.0-flash',endpoint:'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent'},
   ollama:{model:'llama3.2',endpoint:'http://localhost:11434/v1/chat/completions'}}[provider]||{model:'',endpoint:''}
 }
-const AI_MODELS={openai:['gpt-4o-mini','gpt-4.1-mini','o4-mini'],gemini:['gemini-3.8-flash','gemini-2.5-pro'],ollama:['llama3.2','qwen2.5-coder:7b','mistral']};
+const AI_MODELS={openai:['gpt-4o-mini','gpt-4.1-mini','o4-mini'],gemini:['gemini-2.5-flash','gemini-2.5-pro','gemini-2.0-flash'],ollama:['llama3.2','qwen2.5-coder:7b','mistral']};
 function aiModelOptions(provider,selected){
  const models=AI_MODELS[provider]||[],custom=!models.includes(selected);
  return models.map(model=>`<option value="${esc(model)}" ${model===selected?'selected':''}>${esc(model)}</option>`).join('')+`<option value="__custom__" ${custom?'selected':''}>Custom model ID…</option>`;
@@ -254,7 +254,8 @@ async function askAI(question,includeHistory=true){
  const datasetSummary=S.project?JSON.stringify({name:S.project.dataset,rows:S.project.rows,columns:S.project.columnNames||S.project.columns,target:S.project.target,problem:S.project.problem,features:S.project.features}):
   S.profile?JSON.stringify({name:S.profile.name,rows:S.profile.rows,columns:S.profile.columns.map(c=>c.n),target:S.target,problem:S.problem}):'No dataset is currently open.';
  const attachmentNote=S.insightFile?` The user attached a file for you to explain: "${S.insightFile.name}". Its computed summary (statistics were calculated in the browser from the full file; sample rows are only a preview) is: ${S.insightFile.text}${S.insightFile.truncated?' [file truncated]':''}. Explain it in simple language, point out data quality issues, suggest a target column and the ML problem type when relevant, and never invent numbers that are not in the summary.`:'';
- const system=`You are a senior machine-learning engineer embedded in an AutoML application. Give accurate, practical advice about model selection, metrics, preprocessing, debugging, and deployment. Do not invent results. Current dataset: ${datasetSummary} Current model evaluation: ${resultSummary}${attachmentNote}`;
+ const clusterNote=S.cl?.res?` Clustering experiment (unsupervised) on the open dataset: ${JSON.stringify({best:S.cl.res.best,algorithms:S.cl.res.algorithms,profiles:S.cl.res.profiles,columns_used:S.cl.res.features_used,skipped:S.cl.res.skipped_columns,rows_used:S.cl.res.rows_used,rows_total:S.cl.res.rows_total})}. Silhouette ranges from -1 to 1 (higher is better). Explain clusters in plain business language using the traits, and do not invent numbers that are not given.`:'';
+ const system=`You are a senior machine-learning engineer embedded in an AutoML application. Give accurate, practical advice about model selection, metrics, preprocessing, debugging, and deployment. Do not invent results. Current dataset: ${datasetSummary} Current model evaluation: ${resultSummary}${attachmentNote}${clusterNote}`;
  const history=includeHistory?S.msgs.filter(message=>message.r!=='pending').slice(0,-1).slice(-16).map(message=>({role:message.r==='a'?'assistant':'user',content:message.t})):[];
  let response,payload;
  if(config.provider==='gemini'){
@@ -289,7 +290,7 @@ async function beCall(path,opt={}){const token=await Auth.idToken();
   if(e.name==='AbortError')throw new Error(`${path} timed out after 3 minutes — the backend may be stuck on a slow step.`);
   throw e
  }finally{clearTimeout(timeout)}}
-API.uploadReal=f=>{const d=new FormData();d.append('file',f);return beCall('/upload',{method:'POST',body:d})};
+API.uploadReal=async f=>{const d=new FormData();d.append('file',f);const r=await beCall('/upload',{method:'POST',body:d});S.beFile=f;return r};
 API.setTarget=target=>beCall('/target',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target})});
 API.cleanColumns=()=>beCall('/clean-columns',{method:'POST'});
 API.featureEngineering=cfg=>beCall('/feature-engineering',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});
@@ -610,7 +611,8 @@ function target(){const p=S.profile;if(!p)return upload();const col=p.columns.fi
  <label class="lbl">Target column</label><select class="inp mono" onchange="setTarget(this.value)">${p.columns.map(c=>`<option value="${esc(c.n)}" ${c.n===S.target?'selected':''}>${esc(c.n)}</option>`).join('')}</select>
  <div class="mt-5 text-sm" style="color:var(--dim)">Detected problem</div><div class="text-2xl font-bold disp capitalize mt-1">${pt}</div>
  <div class="mt-4 p-3 rounded-xl text-sm flex gap-2" style="background:rgba(99,102,241,.1);color:#c7d2fe"><span class="shrink-0 mt-0.5">${ic('spark',15)}</span>AI detected this as a ${pt} problem because ${why}.</div>
- <div class="flex justify-between mt-6"><button class="btn" onclick="go('profile')">Back</button><button class="btn btn-p" onclick="goToFeatures()">Continue ${ic('arrow',16)}</button></div></div>`}
+ <div class="flex justify-between mt-6"><button class="btn" onclick="go('profile')">Back</button><button class="btn btn-p" onclick="goToFeatures()">Continue ${ic('arrow',16)}</button></div>
+ <div class="text-xs text-center mt-5" style="color:var(--faint)">No target column? <a href="#" style="color:#a5b4fc" onclick="event.preventDefault();go('experiments')">Find natural groups with clustering →</a></div></div>`}
 
 async function goToFeatures(){
  if(!S.file){S.backendReady=false;return train()} // sample dataset has no real file -> straight to demo training
@@ -810,13 +812,132 @@ function predictPage(){const p=initPredict();
  ${p.result.probabilities?`<div class="mt-4 space-y-2">${Object.entries(p.result.probabilities).map(([k,v])=>`<div><div class="flex justify-between text-xs mb-1"><span class="mono">${k}</span><span class="mono">${f(v)}</span></div><div class="h-1.5 rounded-full" style="background:var(--panel2)"><div class="h-full rounded-full" style="width:${v*100}%;background:linear-gradient(90deg,var(--ind),var(--vio))"></div></div></div>`).join('')}</div>`:''}`
  :`<p class="text-sm" style="color:var(--faint)">Fill in the values and press Predict.</p>`}</div></div>`}
 
+/* ============ Experiments: clustering lab ============ */
+const CL_ALGOS=[['KMeans','K-Means','Fast, round-shaped groups'],['GaussianMixture','Gaussian Mixture','Oval-shaped groups'],['Agglomerative','Hierarchical','Merges the closest points step by step'],['Birch','BIRCH','Good for bigger data'],['DBSCAN','DBSCAN','Dense areas and outliers']];
+const CL_COLORS=['#6366f1','#34d399','#fbbf24','#f87171','#38bdf8','#c084fc','#fb923c','#a3e635','#f472b6','#2dd4bf','#94a3b8','#e879f9'];
+const clColor=i=>i<0?'#64748b':CL_COLORS[i%CL_COLORS.length];
+API.cluster=body=>beCall('/cluster',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+API.clusterPredict=values=>beCall('/cluster/predict',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({values})});
+
+function initCl(){const p=S.profile;
+ if(!S.cl)S.cl={sel:new Set(),kmin:2,kmax:8,algos:new Set(CL_ALGOS.map(a=>a[0])),busy:false,err:'',res:null,forName:'',predVals:{},predOut:null,predBusy:false,predErr:'',history:[]};
+ const c=S.cl;
+ if(p&&c.forName!==p.name){c.forName=p.name;c.res=null;c.err='';c.predVals={};c.predOut=null;c.predErr='';
+  const n=Math.max(p.rows,1);
+  c.sel=new Set(p.columns.filter(x=>x.u>1&&x.m/n<=0.6&&(x.t==='numeric'||(x.u<=30&&x.u/n<=0.95))).map(x=>x.n))}
+ return c}
+function clToggleCol(i){const c=initCl(),n=S.profile.columns[i].n;c.sel.has(n)?c.sel.delete(n):c.sel.add(n);render()}
+function clToggleAlgo(a){const c=initCl();c.algos.has(a)?c.algos.delete(a):c.algos.add(a);render()}
+function clSetK(which,v){const c=initCl();c[which]=Math.max(2,Math.min(12,parseInt(v)||2));if(c.kmax<c.kmin)c[which==='kmin'?'kmax':'kmin']=c[which];render()}
+function clSetVal(i,v){const c=initCl();c.predVals[c.res.schema[i].name]=v}
+
+async function runClustering(){const c=initCl();
+ if(!S.file){c.err='Clustering needs your real CSV upload. Please upload the file again (the sample dataset cannot be clustered).';return render()}
+ if(!c.sel.size||!c.algos.size){c.err=!c.sel.size?'Select at least one column.':'Select at least one algorithm.';return render()}
+ c.busy=true;c.err='';render();
+ const body={features:[...c.sel],algorithms:[...c.algos],k_min:c.kmin,k_max:c.kmax};
+ try{
+  if(S.beFile!==S.file)await API.uploadReal(S.file);
+  let res;
+  try{res=await API.cluster(body)}
+  catch(e){if(!/upload a CSV|Columns not found/i.test(e.message||''))throw e;await API.uploadReal(S.file);res=await API.cluster(body)}
+  c.res=res;c.predVals={};c.predOut=null;c.predErr='';
+  c.history.unshift({at:Date.now(),algo:res.best.algorithm,param:res.best.param,k:res.best.n_clusters,sil:res.best.silhouette,cols:res.features_used.length,rows:res.rows_used});
+  c.history=c.history.slice(0,8)
+ }catch(e){c.err=e.message||String(e)}
+ c.busy=false;render()}
+
+async function clAssign(){const c=initCl();c.predBusy=true;c.predErr='';c.predOut=null;render();
+ try{c.predOut=await API.clusterPredict(c.predVals)}catch(e){c.predErr=e.message||String(e)}
+ c.predBusy=false;render()}
+
+async function downloadClusters(){
+ try{
+  const token=await Auth.idToken();
+  const r=await fetch(API.base+'/cluster/download',{headers:token?{Authorization:`Bearer ${token}`}:{}});
+  if(!r.ok)throw new Error((await r.json().catch(()=>({}))).detail||'Download failed');
+  const blob=await r.blob(),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='clustered_data.csv';a.click();URL.revokeObjectURL(a.href);
+ }catch(e){alert(e.message)}}
+function explainClusters(){go('insights');ask('Explain my clustering results in simple words: what does each cluster represent, which algorithm looks best and why, and what could I do with these groups?')}
+
+function clLineChart(series,yKey){
+ const W=520,H=240,L=48,R=14,T=12,B=34,pts=series.flatMap(s=>s.pts.filter(p=>p[yKey]!=null));
+ if(!pts.length)return `<div class="text-sm py-8 text-center" style="color:var(--dim)">Not enough data for this chart.</div>`;
+ const xs=pts.map(p=>p.k),ys=pts.map(p=>p[yKey]),span=(Math.max(...ys)-Math.min(...ys))||1,y0=Math.min(...ys)-span*.1,y1=Math.max(...ys)+span*.1,x0=Math.min(...xs),x1=Math.max(...xs);
+ const X=v=>L+(x1===x0?.5:(v-x0)/(x1-x0))*(W-L-R),Y=v=>T+(1-(v-y0)/(y1-y0))*(H-T-B);
+ const grid=[0,1,2,3,4].map(i=>{const v=y0+(y1-y0)*i/4,y=Y(v);return `<line x1="${L}" x2="${W-R}" y1="${y}" y2="${y}" stroke="var(--line)"/><text x="${L-6}" y="${y+3}" text-anchor="end" font-size="10" fill="var(--dim)">${Math.abs(v)>=1000?Math.round(v):+v.toFixed(2)}</text>`}).join('');
+ const ticks=[...new Set(xs)].sort((a,b)=>a-b).map(k=>`<text x="${X(k)}" y="${H-18}" text-anchor="middle" font-size="10" fill="var(--dim)">${k}</text>`).join('');
+ const lines=series.map(s=>{const sp=s.pts.filter(p=>p[yKey]!=null);return `<polyline fill="none" stroke="${s.color}" stroke-width="2" points="${sp.map(p=>`${X(p.k)},${Y(p[yKey])}`).join(' ')}"/>`+sp.map(p=>`<circle cx="${X(p.k)}" cy="${Y(p[yKey])}" r="3" fill="${s.color}"><title>${esc(s.name)} · k=${p.k}: ${p[yKey]}</title></circle>`).join('')}).join('');
+ return `<svg viewBox="0 0 ${W} ${H}" class="w-full">${grid}${ticks}<text x="${(L+W-R)/2}" y="${H-3}" text-anchor="middle" font-size="10" fill="var(--dim)">number of clusters (k)</text>${lines}</svg>`}
+
+function clScatter(pca){
+ const W=520,H=340,L=14,R=12,T=12,B=30,P=pca.points;
+ if(!P.length)return '';
+ const xs=P.map(p=>p.x),ys=P.map(p=>p.y),x0=Math.min(...xs),x1=Math.max(...xs),y0=Math.min(...ys),y1=Math.max(...ys);
+ const X=v=>L+(x1===x0?.5:(v-x0)/(x1-x0))*(W-L-R),Y=v=>T+(1-(y1===y0?.5:(v-y0)/(y1-y0)))*(H-T-B);
+ const dots=P.map(p=>`<circle cx="${X(p.x).toFixed(1)}" cy="${Y(p.y).toFixed(1)}" r="3" fill="${clColor(p.c)}" fill-opacity=".7"/>`).join('');
+ const e=pca.explained;
+ return `<svg viewBox="0 0 ${W} ${H}" class="w-full"><rect x="${L}" y="${T}" width="${W-L-R}" height="${H-T-B}" fill="none" stroke="var(--line)"/>${dots}<text x="${(L+W-R)/2}" y="${H-10}" text-anchor="middle" font-size="10" fill="var(--dim)">PC1 (${(e[0]*100).toFixed(0)}% of variation) →</text><text x="${(L+W-R)/2}" y="${H-0}" text-anchor="middle" font-size="9" fill="var(--faint)">PC2 (${(e[1]*100).toFixed(0)}%) is vertical</text></svg>`}
+
+const clChip=(on,label,click,tip)=>`<button type="button" class="px-3 py-1.5 rounded-lg text-xs mono" style="border:1px solid ${on?'#6366f1':'var(--line)'};background:${on?'rgba(99,102,241,.16)':'var(--panel2)'};color:${on?'#c7d2fe':'var(--dim)'}" onclick="${click}" ${tip?`title="${esc(tip)}"`:''}>${esc(label)}</button>`;
+
+function clResults(R,c){
+ const b=R.best,name=a=>(CL_ALGOS.find(x=>x[0]===a)||[a,a])[1];
+ const notes=[
+  R.sampled?`Large dataset: clusters were found on a random sample of ${fmt(R.rows_used)} of ${fmt(R.rows_total)} rows. Every row still gets a cluster in the download.`:'',
+  R.truncated?'Time limit reached, so some settings were not tried. Narrow the cluster range or pick fewer algorithms to try them all.':'',
+  Object.keys(R.skipped_columns||{}).length?`Skipped columns: ${Object.entries(R.skipped_columns).map(([k,v])=>`${esc(k)} (${esc(v)})`).join(', ')}.`:''
+ ].filter(Boolean);
+ const algoRows=R.algorithms.map(a=>a.error?`<tr><td class="!text-white">${esc(name(a.algorithm))}</td><td colspan="6" style="color:var(--faint)">${esc(a.error)}</td></tr>`:
+  `<tr style="${a.algorithm===b.algorithm?'background:rgba(99,102,241,.1)':''}"><td class="!text-white">${esc(name(a.algorithm))} ${a.algorithm===b.algorithm?'<span class="tag green ml-1">Best</span>':''}</td><td class="mono">${esc(a.param)}</td><td class="mono">${a.n_clusters}</td><td class="mono">${a.silhouette}</td><td class="mono">${a.davies_bouldin}</td><td class="mono">${fmt(a.calinski_harabasz)}</td><td class="mono">${a.noise_pct}%</td></tr>`).join('');
+ const curveSeries=Object.entries(R.curves).filter(([,v])=>v.length).map(([a,v])=>({name:name(a),color:CL_COLORS[CL_ALGOS.findIndex(x=>x[0]===a)%CL_COLORS.length],pts:v}));
+ const elbow=R.curves.KMeans&&R.curves.KMeans.length?[{name:'K-Means inertia',color:CL_COLORS[0],pts:R.curves.KMeans}]:null;
+ const legend=curveSeries.map(s=>`<span class="inline-flex items-center gap-1 text-xs mr-3" style="color:var(--dim)"><i style="width:10px;height:10px;border-radius:3px;background:${s.color};display:inline-block"></i>${esc(s.name)}</span>`).join('');
+ const cards=R.profiles.map(p=>`<div class="card p-5"><div class="flex items-center justify-between mb-2"><div class="font-semibold flex items-center gap-2"><i style="width:11px;height:11px;border-radius:99px;background:${clColor(p.cluster)};display:inline-block"></i>${esc(p.name)}</div><span class="text-xs mono" style="color:var(--dim)">${fmt(p.size)} rows · ${p.share_pct}%</span></div>
+  <div class="h-1.5 rounded-full mb-3" style="background:var(--panel2)"><div class="h-full rounded-full" style="width:${Math.min(100,p.share_pct)}%;background:${clColor(p.cluster)}"></div></div>
+  ${p.traits.length?`<ul class="text-sm space-y-1" style="color:var(--dim)">${p.traits.map(t=>`<li>• ${esc(t)}</li>`).join('')}</ul>`:`<p class="text-sm" style="color:var(--faint)">Close to the overall average on every column.</p>`}</div>`).join('');
+ const fields=(R.schema||[]).slice(0,12).map((s,i)=>`<div><label class="lbl">${esc(s.name)}</label>${s.type==='numeric'?`<input class="inp" type="number" step="any" placeholder="e.g. ${esc(s.example)}" value="${esc(c.predVals[s.name]??'')}" oninput="clSetVal(${i},this.value)">`:
+  `<select class="inp" onchange="clSetVal(${i},this.value)"><option value="">(any)</option>${(s.choices||[]).map(v=>`<option ${c.predVals[s.name]===v?'selected':''}>${esc(v)}</option>`).join('')}</select>`}</div>`).join('');
+ const out=c.predOut?`<div class="mt-4 p-4 rounded-xl" style="background:rgba(52,211,153,.1)"><div class="font-semibold">This record belongs to <span style="color:var(--ok)">${esc(c.predOut.name)}</span>${c.predOut.share_pct!=null?` <span class="text-xs" style="color:var(--dim)">(${c.predOut.share_pct}% of the data)</span>`:''}</div>${c.predOut.traits.length?`<ul class="text-sm mt-1" style="color:var(--dim)">${c.predOut.traits.map(t=>`<li>• ${esc(t)}</li>`).join('')}</ul>`:''}</div>`:'';
+ return `<div class="card p-6 mb-6" style="border-color:rgba(99,102,241,.45)"><div class="text-xs mb-1" style="color:var(--dim)">Best result</div>
+  <div class="text-xl font-bold disp">${esc(name(b.algorithm))} · ${b.n_clusters} clusters <span class="text-sm font-normal" style="color:var(--dim)">(${esc(b.param)})</span></div>
+  <p class="text-sm mt-2" style="color:var(--dim)">Silhouette score <b class="mono !text-white">${b.silhouette}</b> means <b style="color:#c7d2fe">${esc(b.quality)}</b>. Scores near 1 mean tight, well-separated groups; near 0 means groups overlap.</p>
+  ${notes.map(n=>`<p class="text-xs mt-2" style="color:#fbbf24">${n}</p>`).join('')}
+  <div class="flex flex-wrap gap-2 mt-4"><button class="btn" onclick="downloadClusters()">${ic('file',16)} Download CSV with clusters</button><button class="btn btn-p" onclick="explainClusters()">${ic('spark',16)} Explain with AI</button></div></div>
+ <h2 class="text-base font-semibold mb-3">Algorithm comparison</h2>
+ <div class="card overflow-x-auto mb-2"><table class="w-full min-w-[640px]"><thead><tr class="[&_th]:pt-4"><th>Algorithm</th><th>Setting</th><th>Clusters</th><th>Silhouette ↑</th><th>Davies-Bouldin ↓</th><th>Calinski-Harabasz ↑</th><th>Noise</th></tr></thead><tbody>${algoRows}</tbody></table></div>
+ <p class="text-xs mb-6" style="color:var(--faint)">The best one has the highest silhouette score (points DBSCAN marks as noise count against it). Compare the other columns too: lower Davies-Bouldin and higher Calinski-Harabasz are better.</p>
+ <div class="grid lg:grid-cols-2 gap-4 mb-6"><div class="card p-5"><div class="font-semibold text-sm mb-1">How many clusters? (silhouette)</div><div class="mb-2">${legend}</div>${clLineChart(curveSeries,'silhouette')}</div>
+  <div class="card p-5"><div class="font-semibold text-sm mb-1">Groups on a 2D map</div><div class="text-xs mb-2" style="color:var(--dim)">Your columns squeezed into two axes (PCA). Colors are the best result's clusters.</div>${clScatter(R.pca)}</div></div>
+ ${elbow?`<div class="card p-5 mb-6"><div class="font-semibold text-sm mb-1">Elbow curve (K-Means inertia)</div><div class="text-xs mb-2" style="color:var(--dim)">Look for the bend where adding more clusters stops helping much.</div>${clLineChart(elbow,'inertia')}</div>`:''}
+ <h2 class="text-base font-semibold mb-3">What each cluster looks like</h2><div class="grid md:grid-cols-2 xl:grid-cols-3 gap-4 mb-6">${cards}</div>
+ <div class="card p-6 mb-6"><h2 class="text-base font-semibold mb-1">Which cluster would a new record fall in?</h2><p class="text-xs mb-4" style="color:var(--dim)">Fill in values (blank = typical value). Assigned to the nearest cluster centre.${(R.schema||[]).length>12?` Showing the first 12 of ${R.schema.length} columns; the rest use typical values.`:''}</p>
+  <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">${fields}</div>
+  <button class="btn btn-p mt-4" onclick="clAssign()" ${c.predBusy?'disabled':''}>${c.predBusy?'Checking…':'Find cluster'}</button>
+  ${c.predErr?`<div class="mt-3 text-sm" style="color:#f87171">${esc(c.predErr)}</div>`:''}${out}</div>`}
+
+function experimentsPage(){const p=S.profile;
+ const head=`<h1 class="text-2xl font-bold">Experiments</h1><p class="text-sm mt-1 mb-6" style="color:var(--dim)">Clustering lab: let algorithms find natural groups in your data. No target column needed.</p>`;
+ if(!p)return head+`<div class="card p-10 text-center max-w-xl"><p class="text-sm mb-4" style="color:var(--dim)">Upload a CSV first, then come back here to find groups in it.</p><button class="btn btn-p" onclick="go('upload')">Upload dataset</button></div>`;
+ const c=initCl();
+ const cfg=`<div class="card p-6 mb-6"><div class="mb-4"><div class="font-semibold">${esc(p.name)}</div><div class="text-xs" style="color:var(--dim)">${fmt(p.rows)} rows · ${p.cols} columns</div></div>
+  <label class="lbl">Columns to group by (${c.sel.size} selected)</label><div class="flex flex-wrap gap-2 mb-5">${p.columns.map((x,i)=>clChip(c.sel.has(x.n),x.n,`clToggleCol(${i})`,x.t)).join('')}</div>
+  <label class="lbl">Algorithms</label><div class="flex flex-wrap gap-2 mb-5">${CL_ALGOS.map(a=>clChip(c.algos.has(a[0]),a[1],`clToggleAlgo('${a[0]}')`,a[2])).join('')}</div>
+  <div class="flex flex-wrap items-end gap-4"><div><label class="lbl">Min clusters</label><input type="number" min="2" max="12" class="inp !w-24" value="${c.kmin}" onchange="clSetK('kmin',this.value)"></div>
+  <div><label class="lbl">Max clusters</label><input type="number" min="2" max="12" class="inp !w-24" value="${c.kmax}" onchange="clSetK('kmax',this.value)"></div>
+  <button class="btn btn-p" onclick="runClustering()" ${c.busy?'disabled':''}>${c.busy?`${ic('load',16,'spin')} Finding groups…`:`${ic('flask',16)} Run clustering`}</button></div>
+  <p class="text-xs mt-3" style="color:var(--faint)">IDs, free-text and mostly-empty columns are skipped automatically. Big files are sampled to 3,000 rows for speed.</p>
+  ${c.err?`<div class="mt-4 p-3 rounded-xl text-sm" style="background:rgba(248,113,113,.12);color:#f87171">${esc(c.err)}</div>`:''}</div>`;
+ const hist=c.history.length?`<h2 class="text-base font-semibold mb-3">Runs this session</h2><div class="card overflow-x-auto mb-6"><table class="w-full min-w-[480px]"><thead><tr class="[&_th]:pt-4"><th>Time</th><th>Best algorithm</th><th>Clusters</th><th>Silhouette</th><th>Columns</th></tr></thead><tbody>${c.history.map(h=>`<tr><td class="mono">${new Date(h.at).toLocaleTimeString()}</td><td class="!text-white">${esc(h.algo)} <span class="mono" style="color:var(--dim)">${esc(h.param)}</span></td><td class="mono">${h.k}</td><td class="mono">${h.sil}</td><td class="mono">${h.cols}</td></tr>`).join('')}</tbody></table></div>`:'';
+ return head+cfg+(c.res?clResults(c.res,c):'')+hist}
+
 function placeholder(n){return `<div class="card p-12 text-center max-w-xl mx-auto mt-10"><div class="w-12 h-12 mx-auto rounded-xl flex items-center justify-center mb-4" style="background:rgba(99,102,241,.15);color:#a5b4fc">${ic('spark',22)}</div>
  <h2 class="text-lg font-semibold">${n}</h2><p class="text-sm mt-2 mb-5" style="color:var(--dim)">This section is not built yet. Start a new project to run the full pipeline.</p><button class="btn btn-p" onclick="go('upload')">${ic('plus',16)} New Project</button></div>`}
 
 /* ============ router ============ */
 function render(){const app=$('#app');
  if(!S.user){app.innerHTML=auth();return}
- const V={dashboard,upload,profile,target,features:featuresPage,training,results,analysis,predict:predictPage,projects:projectsPage,'project-detail':projectDetails,datasets:datasetsPage,insights:insightsPage,settings:settingsPage};
+ const V={dashboard,experiments:experimentsPage,upload,profile,target,features:featuresPage,training,results,analysis,predict:predictPage,projects:projectsPage,'project-detail':projectDetails,datasets:datasetsPage,insights:insightsPage,settings:settingsPage};
  const name=(NAV.find(n=>n[0]===S.route)||[])[1];
  app.innerHTML=shell(V[S.route]?V[S.route]():placeholder(name||'Coming soon'));
  const m=$('#insight-messages');if(m)m.scrollTop=m.scrollHeight}
