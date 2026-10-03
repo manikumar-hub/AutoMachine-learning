@@ -2,7 +2,6 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
- <meta name="google-site-verification" content="tiYY5wjiWsjw-27jR_4ia9Y0ExDudLIIn2wfyFw70Z0" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>AutoML AI</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
@@ -296,7 +295,21 @@ API.setTarget=target=>beCall('/target',{method:'POST',headers:{'Content-Type':'a
 API.cleanColumns=()=>beCall('/clean-columns',{method:'POST'});
 API.featureEngineering=cfg=>beCall('/feature-engineering',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});
 API.preprocessReal=()=>beCall('/preprocess',{method:'POST'});
-API.trainReal=()=>beCall('/train',{method:'POST'});
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+/* Long tasks run in a server queue: start a job, then poll until it is done. */
+API.job=async(kind,body,onStatus)=>{
+ const opt={method:'POST'};if(body){opt.headers={'Content-Type':'application/json'};opt.body=JSON.stringify(body)}
+ let j=await beCall('/jobs/'+kind,opt);const id=j.id,t0=Date.now();
+ for(;;){
+  if(j.status==='done')return j.result;
+  if(j.status==='error')throw new Error(j.error||'The job failed.');
+  if(onStatus)onStatus(j);
+  if(Date.now()-t0>20*60*1000)throw new Error('This is taking too long. Please try again in a few minutes.');
+  await sleep(j.status==='queued'?2000:1500);
+  try{j=await beCall('/jobs/'+id)}catch(e){if(/not found/i.test(e.message||''))throw new Error('Your job was lost (the server restarted). Please try again.');throw e}
+ }};
+const queueText=(j,busy)=>j.status==='queued'?`Waiting in queue: position ${j.position} of ${j.queue_length}…`:busy;
+API.trainReal=onStatus=>API.job('train',null,onStatus);
 API.columnsReal=()=>beCall('/columns',{});
 API.selectFeaturesReal=list=>beCall('/select-features',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({features:list})});
 API.modelSchema=()=>beCall('/model/schema',{});
@@ -314,9 +327,9 @@ async function downloadModel(){
 function mapBackendResult(r){
  if(r.problem_type==='regression'){
   const rows=r.models.map(m=>m.error?{name:m.model,error:m.error}:{name:m.model,mae:m.mae,rmse:m.rmse,r2:m.r2_score});
-  return{problem:'regression',rows,best:r.best_model.model}}
+  return{problem:'regression',rows,best:r.best_model.model,feats:r.feature_importance||[],hp:r.hyperparameters||{}}}
  const rows=r.models.map(m=>m.error?{name:m.model,error:m.error}:{name:m.model,acc:m.accuracy,prec:m.precision,rec:m.recall,f1:m.f1_score});
- return{problem:'classification',rows,best:r.best_model.model,cm:r.confusion_matrix}}
+ return{problem:'classification',rows,best:r.best_model.model,cm:r.confusion_matrix,labels:r.class_labels||null,feats:r.feature_importance||[],hp:r.hyperparameters||{}}}
 
 async function runPipeline(){
  if(!S.file||!S.backendReady)throw new Error('A real CSV upload and available backend are required to train a model.');
@@ -326,7 +339,7 @@ async function runPipeline(){
  phase('Preprocessing (impute, scale, encode)…',3);
  await API.preprocessReal();
  phase('Training models — yeh sabse slow step hai, backend terminal me progress dikhega…',4);
- return mapBackendResult(await API.trainReal())}
+ return mapBackendResult(await API.trainReal(j=>{S.trainPhase=queueText(j,'Training models — this is the slowest step…');render()}))}
 
 /* ============ hooks/state ============ */
 const S={user:null,auth:'login',authBusy:false,authErr:'',route:'dashboard',collapsed:false,menu:false,chat:false,msgs:[],detail:false,pw:false,
@@ -346,7 +359,7 @@ function buildProfile(name,rows){const h=rows[0],d=rows.slice(1);let miss=0;
  return{name,rows:d.length,cols:h.length,missing:miss,dups:d.length-new Set(d.map(r=>r.join('\u0001'))).size,columns}}
 function detectProblem(col){ // mirrors validate.py: categorical or <=15 unique -> classification
  return col.t==='categorical'||col.u<=15?'classification':'regression'}
-async function loadFile(f){if(!f)return;if(f.size>100*1024*1024)return alert('Max size is 100 MB');
+async function loadFile(f){if(!f)return;if(f.size>50*1024*1024)return alert('Max size is 50 MB');
  const t=await f.text();S.file=f;S.dataset=null;S.an.img=null;S.cloud={state:CloudStorage.ready&&S.user?'uploading':CloudStorage.initError?'error':'off',p:0,message:CloudStorage.initError};S.profile=buildProfile(f.name,parseCSV(t));afterLoad();
  if(CloudStorage.ready&&S.user){const uid=S.user.uid;S.cloudPromise=CloudStorage.upload(f,p=>{S.cloud.p=p;if(S.route==='upload')render()},S.profile).then(async upload=>{
    S.dataset={...upload,name:f.name};S.cloud={state:'saving',...upload};
@@ -490,7 +503,7 @@ function dropzone(big){return `<div class="card ${big?'p-10':'p-8'} text-center"
  <h3 class="text-lg font-semibold">Upload dataset</h3><p class="text-sm mt-1 mb-5" style="color:var(--dim)">Drag and drop your CSV here, or browse</p>
  <input id="fi" type="file" accept=".csv" hidden onchange="loadFile(this.files[0]);S.route='upload'">
  <div class="flex gap-3 justify-center flex-wrap"><button class="btn btn-p" onclick="$('#fi').click()">Browse files</button><button class="btn" onclick="S.route='upload';useSample()">Try sample dataset</button></div>
- <p class="text-xs mt-4" style="color:var(--faint)">Supported: CSV · Maximum size: 100 MB</p></div>`}
+ <p class="text-xs mt-4" style="color:var(--faint)">Supported: CSV · Maximum size: 50 MB</p></div>`}
 
 function dashboard(){const P=S.projects,has=P.length>0;
  const datasets=new Set(P.map(p=>p.datasetPath||p.dataset).filter(Boolean)).size;
@@ -671,18 +684,26 @@ function results(){const R=S.results;if(!R)return upload();const clf=R.problem==
  <div class="grid lg:grid-cols-2 gap-5 mt-5">
  <div class="card p-6" style="background:linear-gradient(160deg,rgba(99,102,241,.12),var(--panel) 60%);border-color:#2e3660"><div class="flex items-center gap-2 font-semibold">${ic('spark',17)} AI Insights</div><div class="text-xs mb-4" style="color:var(--faint)">Powered by AutoML AI</div>
  <p class="text-sm leading-relaxed" style="color:#c5c9db">${R.best} achieved the ${clf?'highest F1 score':'highest R²'} among the tested models. ${clf?'It balances precision and recall for this classification task.':'It explains the most variance in your target.'}</p>
- <div class="mt-4 text-[13px] font-semibold">Key observations</div><ul class="mt-2 space-y-2 text-sm" style="color:var(--dim)">${['Strong overall performance','Good balance between metrics','Suitable for the current dataset'].map(x=>`<li class="flex gap-2"><span style="color:var(--ok)">${ic('check',15)}</span>${x}</li>`).join('')}</ul>
+ <div class="mt-4 text-[13px] font-semibold">Key observations</div><ul class="mt-2 space-y-2 text-sm" style="color:var(--dim)">${observations(R,b).map(x=>`<li class="flex gap-2"><span style="color:var(--ok)">${ic('check',15)}</span>${esc(x)}</li>`).join('')}</ul>
  <button class="btn mt-5" onclick="go('insights')">Ask AI about this ${ic('arrow',15)}</button></div>
- <div class="card p-6"><div class="font-semibold mb-1">Confusion matrix</div><div class="text-xs mb-4" style="color:var(--faint)">${R.best}</div>${clf?cm(R.cm):'<p class="text-sm" style="color:var(--dim)">Confusion matrix applies to classification problems.</p>'}</div></div>`}
+ <div class="card p-6"><div class="font-semibold mb-1">Confusion matrix</div><div class="text-xs mb-4" style="color:var(--faint)">${R.best}</div>${clf?cm(R.cm,R.labels):'<p class="text-sm" style="color:var(--dim)">Confusion matrix applies to classification problems.</p>'}</div></div>`}
 
-function cm(m){if(!Array.isArray(m)||!m.length)return'';const max=Math.max(1,...m.flat()),labels=m.map((_,index)=>`Class ${index+1}`);
- return `<div class="overflow-x-auto"><table class="w-full text-center text-xs" style="border-collapse:separate;border-spacing:5px"><thead><tr><th>Actual ↓ / Predicted →</th>${labels.map(label=>`<th>${label}</th>`).join('')}</tr></thead><tbody>${m.map((row,index)=>`<tr><th>${labels[index]}</th>${row.map(value=>`<td class="rounded-lg h-12 min-w-12 font-semibold mono" style="background:rgba(99,102,241,${(.12+.72*value/max).toFixed(2)})">${value}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`}
+function cm(m,names){if(!Array.isArray(m)||!m.length)return'';const max=Math.max(1,...m.flat()),labels=m.map((_,index)=>names&&names.length===m.length?String(names[index]):`Class ${index+1}`);
+ return `<div class="overflow-x-auto"><table class="w-full text-center text-xs" style="border-collapse:separate;border-spacing:5px"><thead><tr><th>Actual ↓ / Predicted →</th>${labels.map(label=>`<th class="max-w-[110px] truncate" title="${esc(label)}">${esc(label)}</th>`).join('')}</tr></thead><tbody>${m.map((row,index)=>`<tr><th class="max-w-[110px] truncate" title="${esc(labels[index])}">${esc(labels[index])}</th>${row.map(value=>`<td class="rounded-lg h-12 min-w-12 font-semibold mono" style="background:rgba(99,102,241,${(.12+.72*value/max).toFixed(2)})">${value}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`}
 
-function detail(){const R=S.results,hp=MOCK.hp[R.best]||{random_state:42};
+function observations(R,b){
+ const clf=R.problem==='classification',score=clf?b.f1:b.r2,name=clf?'F1':'R²',out=[];
+ out.push(score>=.9?`Very strong ${name} (${f(score)}) on held-out test data.`:score>=.75?`Good ${name} (${f(score)}): useful, with room to improve.`:score>=.5?`Moderate ${name} (${f(score)}). Adding more informative columns may help.`:`Low ${name} (${f(score)}): the selected columns may not explain the target well.`);
+ const others=R.rows.filter(r=>!r.error&&r.name!==R.best).sort((p,q)=>clf?q.f1-p.f1:q.r2-p.r2);
+ if(others.length){const gap=score-(clf?others[0].f1:others[0].r2);out.push(gap<.01?`Very close to ${others[0].name}, so the simpler model may be enough.`:`Ahead of the next best (${others[0].name}) by ${f(gap,3)} ${name}.`)}
+ if(clf&&b.acc-b.f1>.08)out.push('Accuracy is much higher than F1: your classes may be imbalanced. Check the confusion matrix.');
+ if(R.feats&&R.feats.length)out.push(`${R.feats[0].feature} matters most (${Math.round(R.feats[0].importance*100)}% of the model's decisions).`);
+ return out}
+function detail(){const R=S.results,hp=R.hp??(MOCK.hp[R.best]||{random_state:42}),feats=R.feats??MOCK.feats.map(x=>({feature:x[0],importance:x[1]})),top=Math.max(0.0001,...feats.map(x=>x.importance));
  return `<div class="fixed inset-0 z-40 flex items-center justify-center p-4" style="background:rgba(4,6,12,.7)" onclick="S.detail=false;render()"><div class="card w-full max-w-lg max-h-[88vh] overflow-y-auto p-6" onclick="event.stopPropagation()">
  <div class="flex justify-between items-center mb-4"><h2 class="text-lg font-bold">${R.best}</h2><button aria-label="Close" onclick="S.detail=false;render()">${ic('x',18)}</button></div>
- <div class="text-[13px] font-semibold mb-2">Hyperparameters</div><div class="mono text-xs p-3 rounded-xl space-y-1" style="background:var(--panel2);color:var(--dim)">${Object.entries(hp).map(([k,v])=>`<div>${k}: <span class="text-indigo-300">${v}</span></div>`).join('')}</div>
- <div class="text-[13px] font-semibold mt-5 mb-2">Feature importance</div>${MOCK.feats.map(x=>`<div class="flex items-center gap-3 text-xs mb-2"><span class="w-32 mono truncate" style="color:var(--dim)">${x[0]}</span><div class="flex-1 h-2 rounded-full" style="background:var(--panel2)"><div class="h-full rounded-full" style="width:${x[1]/.31*100}%;background:linear-gradient(90deg,var(--ind),var(--vio))"></div></div><span class="mono w-8">${f(x[1])}</span></div>`).join('')}
+ <div class="text-[13px] font-semibold mb-2">Hyperparameters</div><div class="mono text-xs p-3 rounded-xl space-y-1" style="background:var(--panel2);color:var(--dim)">${Object.keys(hp).length?Object.entries(hp).map(([k,v])=>`<div>${esc(k)}: <span class="text-indigo-300">${esc(String(v))}</span></div>`).join(''):'<div>Default settings</div>'}</div>
+ <div class="text-[13px] font-semibold mt-5">Feature importance</div><div class="text-xs mb-2" style="color:var(--faint)">Share of the model's decisions that depends on each column of your data</div>${feats.length?feats.map(x=>`<div class="flex items-center gap-3 text-xs mb-2"><span class="w-32 mono truncate" title="${esc(x.feature)}" style="color:var(--dim)">${esc(x.feature)}</span><div class="flex-1 h-2 rounded-full" style="background:var(--panel2)"><div class="h-full rounded-full" style="width:${(x.importance/top*100).toFixed(1)}%;background:linear-gradient(90deg,var(--ind),var(--vio))"></div></div><span class="mono w-10 text-right">${Math.round(x.importance*100)}%</span></div>`).join(''):'<p class="text-xs" style="color:var(--dim)">No single column clearly drives this model\'s predictions.</p>'}
  <div class="text-[13px] font-semibold mt-5 mb-2">Training information</div><div class="text-sm space-y-1" style="color:var(--dim)"><div>Train / test split: 80% / 20%</div><div>Random state: 42</div><div>Preprocessing: median impute, scale, one-hot encode</div><div>Dataset: ${S.profile?S.profile.name:'—'}</div></div></div></div>`}
 
 function chat(){return''}
@@ -817,7 +838,7 @@ function predictPage(){const p=initPredict();
 const CL_ALGOS=[['KMeans','K-Means','Fast, round-shaped groups'],['GaussianMixture','Gaussian Mixture','Oval-shaped groups'],['Agglomerative','Hierarchical','Merges the closest points step by step'],['Birch','BIRCH','Good for bigger data'],['DBSCAN','DBSCAN','Dense areas and outliers']];
 const CL_COLORS=['#6366f1','#34d399','#fbbf24','#f87171','#38bdf8','#c084fc','#fb923c','#a3e635','#f472b6','#2dd4bf','#94a3b8','#e879f9'];
 const clColor=i=>i<0?'#64748b':CL_COLORS[i%CL_COLORS.length];
-API.cluster=body=>beCall('/cluster',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+API.cluster=(body,onStatus)=>API.job('cluster',body,onStatus);
 API.clusterPredict=values=>beCall('/cluster/predict',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({values})});
 
 function initCl(){const p=S.profile;
@@ -839,14 +860,14 @@ async function runClustering(){const c=initCl();
  const body={features:[...c.sel],algorithms:[...c.algos],k_min:c.kmin,k_max:c.kmax};
  try{
   if(S.beFile!==S.file)await API.uploadReal(S.file);
-  let res;
-  try{res=await API.cluster(body)}
-  catch(e){if(!/upload a CSV|Columns not found/i.test(e.message||''))throw e;await API.uploadReal(S.file);res=await API.cluster(body)}
+  let res;const st=j=>{c.status=queueText(j,'Finding groups…');render()};
+  try{res=await API.cluster(body,st)}
+  catch(e){if(!/upload a CSV|Columns not found/i.test(e.message||''))throw e;await API.uploadReal(S.file);res=await API.cluster(body,st)}
   c.res=res;c.predVals={};c.predOut=null;c.predErr='';
   c.history.unshift({at:Date.now(),algo:res.best.algorithm,param:res.best.param,k:res.best.n_clusters,sil:res.best.silhouette,cols:res.features_used.length,rows:res.rows_used});
   c.history=c.history.slice(0,8)
  }catch(e){c.err=e.message||String(e)}
- c.busy=false;render()}
+ c.busy=false;c.status='';render()}
 
 async function clAssign(){const c=initCl();c.predBusy=true;c.predErr='';c.predOut=null;render();
  try{c.predOut=await API.clusterPredict(c.predVals)}catch(e){c.predErr=e.message||String(e)}
@@ -926,7 +947,7 @@ function experimentsPage(){const p=S.profile;
   <label class="lbl">Algorithms</label><div class="flex flex-wrap gap-2 mb-5">${CL_ALGOS.map(a=>clChip(c.algos.has(a[0]),a[1],`clToggleAlgo('${a[0]}')`,a[2])).join('')}</div>
   <div class="flex flex-wrap items-end gap-4"><div><label class="lbl">Min clusters</label><input type="number" min="2" max="12" class="inp !w-24" value="${c.kmin}" onchange="clSetK('kmin',this.value)"></div>
   <div><label class="lbl">Max clusters</label><input type="number" min="2" max="12" class="inp !w-24" value="${c.kmax}" onchange="clSetK('kmax',this.value)"></div>
-  <button class="btn btn-p" onclick="runClustering()" ${c.busy?'disabled':''}>${c.busy?`${ic('load',16,'spin')} Finding groups…`:`${ic('flask',16)} Run clustering`}</button></div>
+  <button class="btn btn-p" onclick="runClustering()" ${c.busy?'disabled':''}>${c.busy?`${ic('load',16,'spin')} ${esc(c.status||'Finding groups…')}`:`${ic('flask',16)} Run clustering`}</button></div>
   <p class="text-xs mt-3" style="color:var(--faint)">IDs, free-text and mostly-empty columns are skipped automatically. Big files are sampled to 3,000 rows for speed.</p>
   ${c.err?`<div class="mt-4 p-3 rounded-xl text-sm" style="background:rgba(248,113,113,.12);color:#f87171">${esc(c.err)}</div>`:''}</div>`;
  const hist=c.history.length?`<h2 class="text-base font-semibold mb-3">Runs this session</h2><div class="card overflow-x-auto mb-6"><table class="w-full min-w-[480px]"><thead><tr class="[&_th]:pt-4"><th>Time</th><th>Best algorithm</th><th>Clusters</th><th>Silhouette</th><th>Columns</th></tr></thead><tbody>${c.history.map(h=>`<tr><td class="mono">${new Date(h.at).toLocaleTimeString()}</td><td class="!text-white">${esc(h.algo)} <span class="mono" style="color:var(--dim)">${esc(h.param)}</span></td><td class="mono">${h.k}</td><td class="mono">${h.sil}</td><td class="mono">${h.cols}</td></tr>`).join('')}</tbody></table></div>`:'';
