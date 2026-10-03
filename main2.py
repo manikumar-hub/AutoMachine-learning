@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.templating import Jinja2Templates
 import base64
 import os
@@ -22,6 +23,10 @@ import threading
 import contextvars
 import urllib.request
 import traceback
+import tempfile
+import contextlib
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import MutableMapping
 from pathlib import Path
 from fastapi import Depends
@@ -104,11 +109,20 @@ class FeatureEngineeringRequest(BaseModel):
 BASE_DIR = Path(__file__).resolve().parent
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "autoaiml")
 REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "1") != "0"          # REQUIRE_AUTH=0 only for local dev
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "100"))
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "50"))
 MAX_MODEL_UPLOAD_MB = int(os.getenv("MAX_MODEL_UPLOAD_MB", "300"))
-SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_MINUTES", "30")) * 60
-MAX_ACTIVE_USERS = int(os.getenv("MAX_ACTIVE_USERS", "10"))
-MAX_PARALLEL_TRAININGS = int(os.getenv("MAX_PARALLEL_TRAININGS", "2"))
+# --- capacity (sized for roughly 500+ registered users on a 2-4 GB server) ---
+MAX_ACTIVE_USERS = int(os.getenv("MAX_ACTIVE_USERS", "200"))             # sessions kept in RAM; idle ones move to disk
+STATE_MEMORY_BUDGET_MB = int(os.getenv("STATE_MEMORY_BUDGET_MB", "1500"))  # RAM allowed for users' datasets
+IDLE_SPILL_SECONDS = int(os.getenv("IDLE_SPILL_SECONDS", "1"))           # idle this long -> may move to disk (only under pressure)
+SESSION_RETENTION_SECONDS = int(os.getenv("SESSION_RETENTION_HOURS", "6")) * 3600
+STATE_DIR = Path(os.getenv("STATE_DIR") or (Path(tempfile.gettempdir()) / "automl_state"))
+MAX_PARALLEL_TRAININGS = int(os.getenv("MAX_PARALLEL_TRAININGS", str(max(1, min(4, os.cpu_count() or 1)))))
+MAX_QUEUE_LENGTH = int(os.getenv("MAX_QUEUE_LENGTH", "300"))             # jobs allowed to wait
+JOB_RESULT_TTL_SECONDS = int(os.getenv("JOB_RESULT_TTL_SECONDS", "600"))
+MAX_JOBS_PER_USER_PER_DAY = int(os.getenv("MAX_JOBS_PER_USER_PER_DAY", "200"))
+RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "300"))         # API requests per user per minute
+THREADPOOL_SIZE = int(os.getenv("THREADPOOL_SIZE", "100"))
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 
 _key_env = os.getenv("MODEL_SIGNING_KEY", "")
@@ -129,8 +143,10 @@ else:
 # ======================================================================
 
 _current_state = contextvars.ContextVar("current_state", default=None)
+_current_uid = contextvars.ContextVar("current_uid", default=None)
 _STATES: Dict[str, Dict[str, Any]] = {}
-_STATES_LOCK = threading.Lock()
+_STATES_LOCK = threading.RLock()
+_sweep_clock = {"t": 0.0}
 
 
 def _new_state():
@@ -138,24 +154,166 @@ def _new_state():
         "DATASET": {"df": None, "profile": None, "filename": None},
         "MODEL_STORE": {"bundle": None},
         "last_seen": time.time(),
+        "busy": 0,        # requests currently using this state
+        "jobs": 0,        # queued / running background jobs
+        "bytes": 0,
+        "bytes_at": 0.0,
     }
+
+
+def _nbytes(obj, depth=0):
+    """Approximate RAM held by arrays / dataframes inside a user's data."""
+    if isinstance(obj, pd.DataFrame):
+        return int(obj.memory_usage(deep=True).sum())
+    if isinstance(obj, pd.Series):
+        return int(obj.memory_usage(deep=True))
+    if hasattr(obj, "nbytes") and isinstance(getattr(obj, "nbytes"), (int, np.integer)):
+        return int(obj.nbytes)
+    if hasattr(obj, "data") and hasattr(obj, "indptr") and hasattr(getattr(obj, "data"), "nbytes"):
+        return int(obj.data.nbytes)                     # scipy sparse matrix
+    if depth < 2 and isinstance(obj, dict):
+        return sum(_nbytes(v, depth + 1) for v in list(obj.values()))
+    if depth < 2 and isinstance(obj, (list, tuple)):
+        return sum(_nbytes(v, depth + 1) for v in obj)
+    return 0
+
+
+def _state_bytes(state, force=False):
+    now = time.time()
+    if force or now - state["bytes_at"] > 20:      # cached: measuring big dataframes is not free
+        state["bytes"] = _nbytes(state["DATASET"]) + _nbytes(state["MODEL_STORE"])
+        state["bytes_at"] = now
+    return state["bytes"]
+
+
+def _spill_path(uid):
+    return STATE_DIR / (hashlib.sha256(uid.encode()).hexdigest()[:40] + ".state")
+
+
+def _spill(uid, state):
+    """Write a user's data to disk so it can leave RAM. These are the server's own files."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _spill_path(uid)
+        tmp = path.with_suffix(".tmp")
+        joblib.dump({"DATASET": dict(state["DATASET"]), "MODEL_STORE": dict(state["MODEL_STORE"])}, tmp)
+        os.replace(tmp, path)
+        return True
+    except Exception as exc:
+        print(f"STATE SPILL ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return False
+
+
+def _load_spilled(uid):
+    path = _spill_path(uid)
+    try:
+        if not path.exists():
+            return None
+        if time.time() - path.stat().st_mtime > SESSION_RETENTION_SECONDS:
+            path.unlink(missing_ok=True)
+            return None
+        data = joblib.load(path)
+        state = _new_state()
+        state["DATASET"], state["MODEL_STORE"] = data["DATASET"], data["MODEL_STORE"]
+        return state
+    except Exception as exc:
+        print(f"STATE LOAD ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        path.unlink(missing_ok=True)
+        return None
+
+
+def _total_bytes():
+    return sum(_state_bytes(s) for s in _STATES.values())
+
+
+def _make_room(keep_uid):
+    """Move idle sessions from RAM to disk until the RAM limits hold. False = everybody is busy."""
+    now = time.time()
+    while len(_STATES) > MAX_ACTIVE_USERS or _total_bytes() > STATE_MEMORY_BUDGET_MB * 1024 * 1024:
+        idle = [(s["last_seen"], k) for k, s in _STATES.items()
+                if k != keep_uid and s["busy"] == 0 and s["jobs"] == 0 and now - s["last_seen"] >= IDLE_SPILL_SECONDS]
+        if not idle:
+            return False
+        _, victim = min(idle)
+        _spill(victim, _STATES[victim])            # if the disk is full the session is dropped, never the server
+        del _STATES[victim]
+    return True
+
+
+def _sweep(now):
+    """Every few minutes: forget sessions nobody touched for hours."""
+    if now - _sweep_clock["t"] < 300:
+        return
+    _sweep_clock["t"] = now
+    for uid in [k for k, s in _STATES.items()
+                if now - s["last_seen"] > SESSION_RETENTION_SECONDS and s["busy"] == 0 and s["jobs"] == 0]:
+        del _STATES[uid]
+    for uid in [u for u, q in _RATE.items() if not q or now - q[-1] > 120]:
+        _RATE.pop(uid, None)
+    try:
+        for f in STATE_DIR.glob("*.state"):
+            if now - f.stat().st_mtime > SESSION_RETENTION_SECONDS:
+                f.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _get_state(uid: str):
     now = time.time()
     with _STATES_LOCK:
-        for key in [k for k, v in _STATES.items() if now - v["last_seen"] > SESSION_TTL_SECONDS]:
-            del _STATES[key]                       # idle sessions free their memory
+        _sweep(now)
+        state = _STATES.get(uid)
+        newcomer = state is None
+        if newcomer:
+            state = _load_spilled(uid) or _new_state()
+            _STATES[uid] = state
+        state["last_seen"] = now
+        if not _make_room(uid) and newcomer:
+            del _STATES[uid]                        # the disk copy (if any) stays safe
+            raise HTTPException(503, "Server is at capacity right now. Please try again in a few minutes.")
+        return state
+
+
+def _check_memory_after_growth(uid):
+    """Called after an upload: if RAM is still over budget, refuse instead of risking a crash."""
+    with _STATES_LOCK:
         state = _STATES.get(uid)
         if state is None:
-            if len(_STATES) >= MAX_ACTIVE_USERS:
-                oldest = min(_STATES, key=lambda k: _STATES[k]["last_seen"])
-                if now - _STATES[oldest]["last_seen"] < 300:   # never kick out someone active
-                    raise HTTPException(503, "Server is at capacity right now. Please try again in a few minutes.")
-                del _STATES[oldest]
-            state = _STATES[uid] = _new_state()
-        state["last_seen"] = now
-        return state
+            return
+        _state_bytes(state, force=True)
+        if not _make_room(uid):
+            state["DATASET"].clear()
+            state["bytes"] = 0
+            raise HTTPException(503, "Server memory is full right now. Please try a smaller file or retry in a few minutes.")
+
+
+@contextlib.contextmanager
+def _working():
+    """Mark the current user's state as in use (so it can not be moved to disk meanwhile)."""
+    state = _current_state.get()
+    with _STATES_LOCK:
+        state["jobs"] += 1
+    try:
+        yield
+    finally:
+        with _STATES_LOCK:
+            state["jobs"] -= 1
+            state["last_seen"] = time.time()
+            state["bytes_at"] = 0.0
+
+
+_RATE: Dict[str, deque] = {}
+
+
+def _rate_ok(uid):
+    now = time.time()
+    q = _RATE.setdefault(uid, deque())
+    while q and now - q[0] > 60:
+        q.popleft()
+    if len(q) >= RATE_LIMIT_PER_MIN:
+        return False
+    q.append(now)
+    return True
 
 
 class _UserStore(MutableMapping):
@@ -229,11 +387,12 @@ def _verify_firebase_token(token: str) -> str:
 
 
 async def _bind_user(request: Request):
-    """Runs before every request: only /api/* needs a signed-in user."""
+    """Runs around every request: only /api/* needs a signed-in user."""
     if not request.url.path.startswith("/api"):
+        yield
         return
     if not REQUIRE_AUTH:
-        uid = "local-dev"
+        uid = request.headers.get("X-Dev-User", "local-dev")[:64]      # dev only: lets load tests act as many users
     else:
         scheme, _, token = request.headers.get("Authorization", "").partition(" ")
         if scheme.lower() != "bearer" or not token.strip():
@@ -246,7 +405,19 @@ async def _bind_user(request: Request):
             print(f"AUTH ERROR (503): {type(exc).__name__}: {exc}", file=sys.stderr)
             traceback.print_exc()
             raise HTTPException(503, "Could not verify your sign-in right now. Please try again.")
-    _current_state.set(_get_state(uid))
+    if not _rate_ok(uid):
+        raise HTTPException(429, "Too many requests. Please slow down a little.")
+    state = await run_in_threadpool(_get_state, uid)       # may touch the disk, so never on the event loop
+    with _STATES_LOCK:
+        state["busy"] += 1
+    _current_uid.set(uid)
+    _current_state.set(state)
+    try:
+        yield
+    finally:
+        with _STATES_LOCK:
+            state["busy"] -= 1
+            state["last_seen"] = time.time()
 
 
 # ======================================================================
@@ -280,6 +451,14 @@ _TRAIN_SLOTS = threading.BoundedSemaphore(MAX_PARALLEL_TRAININGS)
 _PLOT_LOCK = threading.Lock()          # matplotlib's pyplot is not thread-safe
 
 app = FastAPI(title="AutoML AI", dependencies=[Depends(_bind_user)])
+app.add_middleware(GZipMiddleware, minimum_size=1000)   # HTML/JSON shrink ~5x: less bandwidth per user
+
+
+@app.on_event("startup")
+async def _startup():
+    import anyio
+    anyio.to_thread.current_default_thread_limiter().total_tokens = THREADPOOL_SIZE   # many users waiting on I/O
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
 if CORS_ORIGINS:   # same-origin deployment needs no CORS; set CORS_ORIGINS only if the UI is hosted elsewhere
     app.add_middleware(
         CORSMiddleware,
@@ -412,7 +591,8 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 @app.get("/", response_class=HTMLResponse)
 async def landing_page():
     # public marketing page; the app itself lives at /app
-    return FileResponse(BASE_DIR / "templates" / "landing.html", media_type="text/html")
+    return FileResponse(BASE_DIR / "templates" / "landing.html", media_type="text/html",
+                        headers={"Cache-Control": "public, max-age=300"})
 
 
 @app.get("/app", response_class=HTMLResponse)
@@ -422,7 +602,7 @@ async def read_app(request: Request):
        # 'request' is strictly required by Jinja2 in FastAPI
         "message": "Hello from the backend!"
     }
-    return templates.TemplateResponse(request, "index.html", context)
+    return templates.TemplateResponse(request, "index.html", context, headers={"Cache-Control": "public, max-age=60"})
 
 
 @app.post("/api/upload")
@@ -433,25 +613,29 @@ async def upload_file(file: UploadFile = File(...)):
     content = await file.read()
     if len(content) > MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(413, f"File is too large (max {MAX_UPLOAD_MB} MB).")
-    try:
-        df = pd.read_csv(io.BytesIO(content))
-    except Exception:
-        raise HTTPException(400, "Could not read this file as CSV.")
+    def _parse():
+        try:
+            frame = pd.read_csv(io.BytesIO(content))
+        except Exception:
+            raise HTTPException(400, "Could not read this file as CSV.")
+        return frame, {
+            "filename": file.filename,
+            "rows": frame.shape[0],
+            "columns": frame.shape[1],
+            "column_names": frame.columns.tolist(),
+            "missing_values": frame.isnull().sum().to_dict(),
+            "dtypes": frame.dtypes.astype(str).to_dict()
+        }
 
-    profile = {
-        "filename": file.filename,
-        "rows": df.shape[0],
-        "columns": df.shape[1],
-        "column_names": df.columns.tolist(),
-        "missing_values": df.isnull().sum().to_dict(),
-        "dtypes": df.dtypes.astype(str).to_dict()
-    }
+    df, profile = await run_in_threadpool(_parse)          # a big CSV must not freeze every other user
+    del content
 
     DATASET.clear()
     MODEL_STORE["bundle"] = None
     DATASET["df"] = df
     DATASET["profile"] = profile
     DATASET["filename"] = file.filename
+    await run_in_threadpool(_check_memory_after_growth, _current_uid.get())
     return profile
 
 
@@ -834,9 +1018,79 @@ def train_models():
     if not _TRAIN_SLOTS.acquire(blocking=False):
         raise HTTPException(429, "Server is busy training other models. Please try again in a minute.")
     try:
-        return _train_models_impl()
+        with _working():
+            return _train_models_impl()
     finally:
         _TRAIN_SLOTS.release()
+
+
+def _feature_groups(preprocessor, width):
+    """Map every column of the processed matrix back to the ORIGINAL column it came from."""
+    groups, offset = [], 0
+    for name, trans, cols in preprocessor.transformers_:
+        if name == "numerical":
+            for col in cols:
+                groups.append((col, [offset]))
+                offset += 1
+        elif name == "categorical":
+            encoder = trans.named_steps["encoder"]
+            for i, col in enumerate(cols):
+                n = len(encoder.categories_[i])
+                groups.append((col, list(range(offset, offset + n))))
+                offset += n
+    return groups if offset == width else []
+
+
+def _feature_importance(model, problem_type, seconds=20):
+    """Grouped permutation importance on the test set: how much does the score drop when one
+    ORIGINAL column (all of its one-hot pieces together) is shuffled? Returns the top columns as shares."""
+    try:
+        X = DATASET["X_test"]
+        X = X.toarray() if hasattr(X, "toarray") else np.asarray(X)
+        y = np.asarray(DATASET["y_test"])
+        groups = _feature_groups(DATASET["preprocessor"], X.shape[1])
+        if not groups or len(X) < 5:
+            return []
+        rng = np.random.RandomState(42)
+        pick = rng.permutation(len(X))[:1000]
+        Xs, ys = X[pick], y[pick]
+        if problem_type == "classification":
+            score = lambda m: f1_score(ys, model.predict(m), average="weighted", zero_division=0)
+        else:
+            score = lambda m: r2_score(ys, model.predict(m))
+        base, deadline, drops = score(Xs), time.time() + seconds, {}
+        for col, idx in groups:
+            if time.time() > deadline:
+                break
+            lost = []
+            for _ in range(3):
+                shuffled = Xs.copy()
+                shuffled[:, idx] = Xs[np.ix_(rng.permutation(len(Xs)), idx)]
+                lost.append(base - score(shuffled))
+            drops[col] = max(0.0, float(np.mean(lost)))
+        total = sum(drops.values())
+        if total <= 1e-9:
+            return []
+        ranked = sorted(drops.items(), key=lambda kv: -kv[1])[:10]
+        return [{"feature": str(c), "importance": round(v / total, 4)} for c, v in ranked if v > 0]
+    except Exception as exc:
+        print(f"FEATURE IMPORTANCE SKIPPED: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return []
+
+
+def _simple_params(model):
+    out = {}
+    for key, value in model.get_params().items():
+        if value is None or isinstance(value, (str, int, float, bool)):
+            out[key] = value
+    return dict(list(out.items())[:14])
+
+
+def _model_details(model, problem_type):
+    details = {"feature_importance": _feature_importance(model, problem_type), "hyperparameters": _simple_params(model)}
+    if problem_type == "classification":
+        details["class_labels"] = [str(c) for c in getattr(model, "classes_", [])]
+    return _json_safe(details)
 
 
 def _train_models_impl():
@@ -894,7 +1148,8 @@ def _train_models_impl():
 
         return {
             "message": "Model training completed", "problem_type": "classification",
-            "models": results, "best_model": best_result, "confusion_matrix": cm
+            "models": results, "best_model": best_result, "confusion_matrix": cm,
+            **_model_details(best_model, "classification"),
         }
 
     # ---------------- regression ----------------
@@ -937,7 +1192,8 @@ def _train_models_impl():
 
     return {
         "message": "Model training completed", "problem_type": "regression",
-        "models": results, "best_model": best_result
+        "models": results, "best_model": best_result,
+        **_model_details(trained[best_result["model"]], "regression"),
     }
 
 
@@ -1246,9 +1502,100 @@ def run_clustering(request: ClusterRequest):
     if not _TRAIN_SLOTS.acquire(blocking=False):
         raise HTTPException(429, "Server is busy running other models. Please try again in a minute.")
     try:
-        return _cluster_impl(request)
+        with _working():
+            return _cluster_impl(request)
     finally:
         _TRAIN_SLOTS.release()
+
+
+# ======================================================================
+# JOB QUEUE — training / clustering run in a small worker pool.
+# The browser starts a job, then polls for its status, so no HTTP request
+# stays open for minutes and waiting users see their place in line.
+# ======================================================================
+
+_JOBS: Dict[str, Dict[str, Any]] = {}
+_JOBS_LOCK = threading.Lock()
+_DAILY_JOBS: Dict[Any, int] = {}
+_EXEC = ThreadPoolExecutor(max_workers=MAX_PARALLEL_TRAININGS, thread_name_prefix="job")
+
+
+def _job_view(job):
+    out = {"id": job["id"], "kind": job["kind"], "status": job["status"]}
+    if job["status"] == "queued":
+        with _JOBS_LOCK:
+            queued = [v for v in _JOBS.values() if v["status"] == "queued"]
+        out["position"] = 1 + sum(1 for v in queued if v["created"] < job["created"])
+        out["queue_length"] = len(queued)
+    elif job["status"] == "running":
+        out["elapsed"] = round(time.time() - job["started"], 1)
+    elif job["status"] == "done":
+        out["result"] = job["result"]
+    else:
+        out["error"], out["status_code"] = job["error"], job["code"]
+    return out
+
+
+def _submit_job(kind, fn):
+    uid, state, now = _current_uid.get(), _current_state.get(), time.time()
+    with _JOBS_LOCK:
+        for jid in [j for j, v in _JOBS.items() if v["finished"] and now - v["finished"] > JOB_RESULT_TTL_SECONDS]:
+            del _JOBS[jid]
+        today = time.strftime("%Y%m%d")
+        for key in [k for k in _DAILY_JOBS if k[1] != today]:
+            del _DAILY_JOBS[key]
+        if any(v["uid"] == uid and v["status"] in ("queued", "running") for v in _JOBS.values()):
+            raise HTTPException(409, "You already have a job in progress. Please wait for it to finish.")
+        if _DAILY_JOBS.get((uid, today), 0) >= MAX_JOBS_PER_USER_PER_DAY:
+            raise HTTPException(429, "Daily limit reached for training runs. Please try again tomorrow.")
+        if sum(1 for v in _JOBS.values() if v["status"] == "queued") >= MAX_QUEUE_LENGTH:
+            raise HTTPException(503, "The queue is full right now. Please try again in a few minutes.")
+        _DAILY_JOBS[(uid, today)] = _DAILY_JOBS.get((uid, today), 0) + 1
+        job = {"id": secrets.token_urlsafe(12), "uid": uid, "kind": kind, "status": "queued", "created": now,
+               "started": None, "finished": None, "result": None, "error": None, "code": None}
+        _JOBS[job["id"]] = job
+    with _STATES_LOCK:
+        state["jobs"] += 1                      # keeps this user's data in RAM until the job ends
+    ctx = contextvars.copy_context()            # the worker sees the same user's DATASET
+
+    def runner():
+        job["status"], job["started"] = "running", time.time()
+        try:
+            job["result"] = ctx.run(fn)
+            job["status"] = "done"
+        except HTTPException as exc:
+            job.update(status="error", error=str(exc.detail), code=exc.status_code)
+        except Exception as exc:
+            print(f"JOB ERROR ({kind}): {type(exc).__name__}: {exc}", file=sys.stderr)
+            traceback.print_exc()
+            job.update(status="error", error=f"{type(exc).__name__}: {exc}"[:300], code=500)
+        finally:
+            job["finished"] = time.time()
+            with _STATES_LOCK:
+                state["jobs"] -= 1
+                state["last_seen"] = time.time()
+                state["bytes_at"] = 0.0
+
+    _EXEC.submit(runner)
+    return _job_view(job)
+
+
+@app.post("/api/jobs/train")
+def start_train_job():
+    return _submit_job("train", _train_models_impl)
+
+
+@app.post("/api/jobs/cluster")
+def start_cluster_job(request: ClusterRequest):
+    return _submit_job("cluster", lambda: _cluster_impl(request))
+
+
+@app.get("/api/jobs/{job_id}")
+def job_status(job_id: str):
+    job = _JOBS.get(job_id)
+    if job is None or job["uid"] != _current_uid.get():
+        raise HTTPException(404, "Job not found.")
+    return _job_view(job)
 
 
 def _require_cluster_run():
