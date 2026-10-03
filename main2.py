@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.templating import Jinja2Templates
 import base64
 import os
@@ -410,13 +410,19 @@ def _fill(series, strategy, constant=None):
 # ======================================================================
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 @app.get("/", response_class=HTMLResponse)
-async def read_root(request: Request):
+async def landing_page():
+    # public marketing page; the app itself lives at /app
+    return FileResponse(BASE_DIR / "templates" / "landing.html", media_type="text/html")
+
+
+@app.get("/app", response_class=HTMLResponse)
+async def read_app(request: Request):
     # Pass data into the template using a context dictionary
     context = {
        # 'request' is strictly required by Jinja2 in FastAPI
         "message": "Hello from the backend!"
     }
-    return templates.TemplateResponse(request,"index.html", context)
+    return templates.TemplateResponse(request, "index.html", context)
 
 
 @app.post("/api/upload")
