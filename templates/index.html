@@ -72,9 +72,9 @@ const API={base:location.protocol==='file:'?'http://localhost:8000/api':'/api',
   ({a:/random|forest/i.test(q)?'Random Forest captures non-linear relationships, but Gradient Boosting corrects earlier trees\' errors step by step, which gave it a higher F1 here.':/recall|precision/i.test(q)?'Recall 0.89 means it catches most churners; precision 0.87 means most churn alerts are correct. Focus on recall if missed churn is costly.':'The selected model has the highest F1 among those tested. Ask about a metric, a model, or the confusion matrix.'}),600)};
 
 function buildResults(problem){
- if(problem==='regression'){const rows=MOCK.reg.map(r=>({name:r[0],mae:r[1],rmse:r[2],r2:r[3]}));const b=rows.reduce((a,c)=>c.r2>a.r2?c:a);return{problem,rows,best:b.name}}
+ if(problem==='regression'){const rows=MOCK.reg.map(r=>({name:r[0],mae:r[1],rmse:r[2],r2:r[3]}));const b=rows.reduce((a,c)=>c.r2>a.r2?c:a);return{problem,rows,best:b.name,demo:true}}
  const rows=MOCK.clf.map(r=>({name:r[0],acc:r[1],prec:r[2],rec:r[3],f1:r[4],auc:r[5]}));const b=rows.reduce((a,c)=>c.f1>a.f1?c:a);
- return{problem,rows,best:b.name,cm:[[1180,230],[182,626]]}}
+ return{problem,rows,best:b.name,cm:[[1180,230],[182,626]],demo:true}}
 
 /* ============ services/storage.js — Firebase Storage ============ */
 // Paste your Firebase web config (Console > Project settings > Your apps). Leave empty to run without cloud storage.
@@ -255,7 +255,8 @@ async function askAI(question,includeHistory=true){
   S.profile?JSON.stringify({name:S.profile.name,rows:S.profile.rows,columns:S.profile.columns.map(c=>c.n),target:S.target,problem:S.problem}):'No dataset is currently open.';
  const attachmentNote=S.insightFile?` The user attached a file for you to explain: "${S.insightFile.name}". Its computed summary (statistics were calculated in the browser from the full file; sample rows are only a preview) is: ${S.insightFile.text}${S.insightFile.truncated?' [file truncated]':''}. Explain it in simple language, point out data quality issues, suggest a target column and the ML problem type when relevant, and never invent numbers that are not in the summary.`:'';
  const clusterNote=S.cl?.res?` Clustering experiment (unsupervised) on the open dataset: ${JSON.stringify({best:S.cl.res.best,algorithms:S.cl.res.algorithms,profiles:S.cl.res.profiles,columns_used:S.cl.res.features_used,skipped:S.cl.res.skipped_columns,rows_used:S.cl.res.rows_used,rows_total:S.cl.res.rows_total})}. Silhouette ranges from -1 to 1 (higher is better). Explain clusters in plain business language using the traits, and do not invent numbers that are not given.`:'';
- const system=`You are a senior machine-learning engineer embedded in an AutoML application. Give accurate, practical advice about model selection, metrics, preprocessing, debugging, and deployment. Do not invent results. Current dataset: ${datasetSummary} Current model evaluation: ${resultSummary}${attachmentNote}${clusterNote}`;
+ const cvNote=S.cv?.res?` Cross-validation (${S.cv.res.scores.length}-fold, ${S.cv.res.model||'Random Forest'}, scoring ${S.cv.res.scoring}): ${JSON.stringify({scores:S.cv.res.scores,mean:S.cv.res.mean_score,std:S.cv.res.std_dev})}. A small standard deviation means the score is stable across folds.`:'';
+ const system=`You are a senior machine-learning engineer embedded in an AutoML application. Give accurate, practical advice about model selection, metrics, preprocessing, debugging, and deployment. Do not invent results. Current dataset: ${datasetSummary} Current model evaluation: ${resultSummary}${attachmentNote}${clusterNote}${cvNote}`;
  const history=includeHistory?S.msgs.filter(message=>message.r!=='pending').slice(0,-1).slice(-16).map(message=>({role:message.r==='a'?'assistant':'user',content:message.t})):[];
  let response,payload;
  if(config.provider==='gemini'){
@@ -299,7 +300,7 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 /* Long tasks run in a server queue: start a job, then poll until it is done. */
 API.job=async(kind,body,onStatus)=>{
  const opt={method:'POST'};if(body){opt.headers={'Content-Type':'application/json'};opt.body=JSON.stringify(body)}
- let j=await beCall('/jobs/'+kind,opt);const id=j.id,t0=Date.now();
+ let j=await beCall(kind.startsWith('/')?kind:'/jobs/'+kind,opt);const id=j.id,t0=Date.now();
  for(;;){
   if(j.status==='done')return j.result;
   if(j.status==='error')throw new Error(j.error||'The job failed.');
@@ -382,7 +383,7 @@ async function train(){S.route='training';S.step=0;S.trainErr='';S.saveWarn='';r
  try{
   S.project=null;
   const result=await runPipeline();   // training itself never waits on Firebase
-  S.results=result;S.trainPhase='';S.route='results';S.step=STEPS.length;render();
+  S.cv=null;S.results=result;S.trainPhase='';S.route='results';S.step=STEPS.length;render();
   if(CloudStorage.ready&&S.user?.uid)saveRunToCloud(result)   // background, with timeouts
  }catch(error){
   console.error('Training failed',error);
@@ -445,7 +446,7 @@ function auth(){const su=S.auth==='signup',busy=S.authBusy;
  ${S.authErr?`<div class="text-xs p-2.5 rounded-lg" style="background:rgba(248,113,113,.12);color:#f87171">${S.authErr}</div>`:''}
  <button class="btn btn-p w-full" ${busy?'disabled':''}>${busy?ic('load',16,'spin'):(su?'Create account':'Sign in')}</button>
  <div class="flex items-center gap-3 text-xs" style="color:var(--faint)"><div class="flex-1 h-px" style="background:var(--line)"></div>OR<div class="flex-1 h-px" style="background:var(--line)"></div></div>
-</form>${demo}
+ <button type="button" class="btn w-full" ${busy?'disabled':''} onclick="googleAuth()"><b>G</b> Continue with Google</button></form>${demo}
  <p class="text-center text-sm mt-5" style="color:var(--dim)">${su?'Already have an account?':"Don't have an account?"} <a href="#" class="text-indigo-400 font-medium" onclick="event.preventDefault();S.auth='${su?'login':'signup'}';S.authErr='';render()">${su?'Sign in':'Create account'}</a></p></div></div>`}
 
 async function submitAuth(form,isSignup){
@@ -679,7 +680,7 @@ function results(){const R=S.results;if(!R)return upload();const clf=R.problem==
  ${R.rows.map(r=>r.error?`<tr><td class="font-medium !text-white">${esc(r.name)}</td><td colspan="${key.length}"><span class="tag warn">Failed</span> ${esc(r.error)}</td></tr>`:`<tr class="${r.name===R.best?'sel':''}"><td class="font-medium ${r.name===R.best?'':'!text-white'}">${esc(r.name)}${r.name===R.best?` <span class="tag ml-2" style="background:rgba(99,102,241,.2);color:#c7d2fe">${clf?'Highest F1':'Highest R²'}</span>`:''}</td>${key.map(k=>`<td class="mono text-right">${f(r[k])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
  <div class="card p-6"><div class="flex items-center gap-2 text-sm font-semibold" style="color:#a5b4fc">${ic('spark',15)} Selected model</div><div class="text-2xl font-bold disp mt-2">${R.best}</div>
  <div class="grid grid-cols-2 gap-3 mt-5">${tiles.map(t=>`<div class="p-3 rounded-xl" style="background:var(--panel2)"><div class="text-xs" style="color:var(--faint)">${t[0]}</div><div class="text-xl font-bold mono">${f(t[1])}</div></div>`).join('')}</div>
- <div class="flex flex-col gap-2 mt-5"><button class="btn" onclick="S.detail=true;render()">View model details</button><button class="btn btn-p" onclick="downloadModel()">${ic('up',16)} Download model</button></div>
+ <div class="flex flex-col gap-2 mt-5"><button class="btn" onclick="S.detail=true;render()">View model details</button><button class="btn" onclick="S.exTab='cv';go('experiments')">Check stability (cross-validation)</button><button class="btn btn-p" onclick="downloadModel()">${ic('up',16)} Download model</button></div>
  <button class="btn w-full mt-2" onclick="go('predict')">${ic('flask',16)} Try it: enter feature values</button></div></div>
  <div class="grid lg:grid-cols-2 gap-5 mt-5">
  <div class="card p-6" style="background:linear-gradient(160deg,rgba(99,102,241,.12),var(--panel) 60%);border-color:#2e3660"><div class="flex items-center gap-2 font-semibold">${ic('spark',17)} AI Insights</div><div class="text-xs mb-4" style="color:var(--faint)">Powered by AutoML AI</div>
@@ -699,7 +700,7 @@ function observations(R,b){
  if(clf&&b.acc-b.f1>.08)out.push('Accuracy is much higher than F1: your classes may be imbalanced. Check the confusion matrix.');
  if(R.feats&&R.feats.length)out.push(`${R.feats[0].feature} matters most (${Math.round(R.feats[0].importance*100)}% of the model's decisions).`);
  return out}
-function detail(){const R=S.results,hp=R.hp??(MOCK.hp[R.best]||{random_state:42}),feats=R.feats??MOCK.feats.map(x=>({feature:x[0],importance:x[1]})),top=Math.max(0.0001,...feats.map(x=>x.importance));
+function detail(){const R=S.results,hp=R.demo?(MOCK.hp[R.best]||{random_state:42}):(R.hp||{}),feats=R.demo?MOCK.feats.map(x=>({feature:x[0],importance:x[1]})):(R.feats||[]),top=Math.max(0.0001,...feats.map(x=>x.importance));
  return `<div class="fixed inset-0 z-40 flex items-center justify-center p-4" style="background:rgba(4,6,12,.7)" onclick="S.detail=false;render()"><div class="card w-full max-w-lg max-h-[88vh] overflow-y-auto p-6" onclick="event.stopPropagation()">
  <div class="flex justify-between items-center mb-4"><h2 class="text-lg font-bold">${R.best}</h2><button aria-label="Close" onclick="S.detail=false;render()">${ic('x',18)}</button></div>
  <div class="text-[13px] font-semibold mb-2">Hyperparameters</div><div class="mono text-xs p-3 rounded-xl space-y-1" style="background:var(--panel2);color:var(--dim)">${Object.keys(hp).length?Object.entries(hp).map(([k,v])=>`<div>${esc(k)}: <span class="text-indigo-300">${esc(String(v))}</span></div>`).join(''):'<div>Default settings</div>'}</div>
@@ -938,9 +939,46 @@ function clResults(R,c){
   <button class="btn btn-p mt-4" onclick="clAssign()" ${c.predBusy?'disabled':''}>${c.predBusy?'Checking…':'Find cluster'}</button>
   ${c.predErr?`<div class="mt-3 text-sm" style="color:#f87171">${esc(c.predErr)}</div>`:''}${out}</div>`}
 
+/* ============ Experiments: cross-validation ============ */
+const CV_LABELS={f1_weighted:'F1 (weighted)',r2:'R²'};
+API.crossValidation=onStatus=>API.job('/cross-validation',null,onStatus);
+function cvFriendly(msg){
+ if(/select target|run preprocessing|upload a CSV/i.test(msg))return 'The server no longer has this training session (it may have restarted, or another file was loaded, for example in the clustering lab). Go to Upload, train again, then come back here.';
+ return msg}
+async function runCV(){const c=S.cv=S.cv||{};c.busy=true;c.err='';c.res=null;c.status='';render();
+ try{c.res=await API.crossValidation(j=>{c.status=queueText(j,'Running 5-fold cross-validation…');render()})}
+ catch(e){c.err=cvFriendly(e.message||String(e))}
+ c.busy=false;c.status='';render()}
+function cvVerdict(res,R){
+ const m=res.mean_score,sd=res.std_dev,name=CV_LABELS[res.scoring]||res.scoring,out=[];
+ out.push(sd<.02?'Very stable: the score barely changes between the folds.':sd<.05?'Fairly stable: there are small differences between folds.':'Unstable: the score changes a lot between folds. The model depends on which rows it sees, so more data or fewer columns may help.');
+ const rows=(R.rows||[]).filter(r=>!r.error),row=rows.find(r=>r.name===res.model)||rows.find(r=>/RandomForest/i.test(r.name)),t=row?(R.problem==='classification'?row.f1:row.r2):null;
+ if(t!=null){const d=t-m;out.push(Math.abs(d)<.03?`This agrees with the ${name} from your single train/test split (${f(t,3)}), so that earlier score looks trustworthy.`:d>0?`Your single train/test split gave ${f(t,3)}, higher than the cross-validated average. That split may have been a lucky one, so trust ${f(m,3)} more.`:`Your single train/test split gave ${f(t,3)}, lower than the cross-validated average. That split may have been an unlucky one.`)}
+ if(m<.5)out.push(`A mean ${name} below 0.5 means the model explains the target poorly.`);
+ return out}
+function explainCV(){go('insights');ask('Explain my cross-validation results in simple words. Is my model reliable, and what should I do next?')}
+function cvPanel(){const R=S.results,c=S.cv=S.cv||{};
+ if(!R||R.demo)return `<div class="card p-10 text-center max-w-xl"><p class="text-sm mb-4" style="color:var(--dim)">Train a model on your own CSV first. Cross-validation then re-tests it on 5 different splits of your data.</p><button class="btn btn-p" onclick="go('upload')">Upload dataset</button></div>`;
+ const res=c.res,model=(res&&res.model)||(R.problem==='classification'?'RandomForestClassifier':'RandomForestRegressor');
+ const intro=`<div class="card p-6 mb-6"><div class="font-semibold mb-1">5-fold cross-validation</div>
+  <p class="text-sm" style="color:var(--dim)">One train/test split can be lucky or unlucky. Here your data is cut into 5 parts, a model is trained 5 times, and each time it is tested on a different part. If the 5 scores are close, you can trust the result.</p>
+  <p class="text-xs mt-2" style="color:var(--faint)">Model used: <span class="mono">${esc(model)}</span> (100 trees). Scored on the same data you just trained with.</p>
+  <button class="btn btn-p mt-4" onclick="runCV()" ${c.busy?'disabled':''}>${c.busy?`${ic('load',16,'spin')} ${esc(c.status||'Running cross-validation…')}`:`${ic('flask',16)} ${res?'Run again':'Run cross-validation'}`}</button>
+  ${c.err?`<div class="mt-4 p-3 rounded-xl text-sm" style="background:rgba(248,113,113,.12);color:#f87171">${esc(c.err)}</div>`:''}</div>`;
+ if(!res)return intro;
+ const label=CV_LABELS[res.scoring]||res.scoring,n=res.scores.length;
+ const bars=res.scores.map((v,i)=>`<div class="flex items-center gap-3 text-xs mb-2"><span class="w-14" style="color:var(--dim)">Fold ${i+1}</span><div class="flex-1 h-3 rounded-full" style="background:var(--panel2)"><div class="h-full rounded-full" style="width:${(Math.max(0,Math.min(1,v))*100).toFixed(1)}%;background:linear-gradient(90deg,var(--ind),var(--vio))"></div></div><span class="mono w-14 text-right">${f(v,3)}</span></div>`).join('');
+ return intro+`<div class="grid lg:grid-cols-2 gap-5 mb-6"><div class="card p-6"><div class="text-xs" style="color:var(--dim)">Average ${esc(label)} over ${n} folds</div>
+  <div class="text-4xl font-bold disp mt-1">${f(res.mean_score,3)} <span class="text-lg font-normal" style="color:var(--dim)">± ${f(res.std_dev,3)}</span></div>
+  <p class="text-xs mt-1" style="color:var(--faint)">The ± is the standard deviation: how much the score moves between folds. Smaller is steadier.</p><div class="mt-5">${bars}</div></div>
+  <div class="card p-6"><div class="font-semibold text-sm mb-3">What this means</div><ul class="text-sm space-y-2" style="color:var(--dim)">${cvVerdict(res,R).map(x=>`<li class="flex gap-2"><span style="color:var(--ok)">${ic('check',15)}</span>${esc(x)}</li>`).join('')}</ul>
+  <button class="btn mt-5" onclick="explainCV()">${ic('spark',16)} Explain with AI</button></div></div>`}
+
 function experimentsPage(){const p=S.profile;
- const head=`<h1 class="text-2xl font-bold">Experiments</h1><p class="text-sm mt-1 mb-6" style="color:var(--dim)">Clustering lab: let algorithms find natural groups in your data. No target column needed.</p>`;
- if(!p)return head+`<div class="card p-10 text-center max-w-xl"><p class="text-sm mb-4" style="color:var(--dim)">Upload a CSV first, then come back here to find groups in it.</p><button class="btn btn-p" onclick="go('upload')">Upload dataset</button></div>`;
+ const head=`<h1 class="text-2xl font-bold">Experiments</h1><p class="text-sm mt-1 mb-6" style="color:var(--dim)">Try things on your data: find natural groups with clustering, or check how steady your model's score is with cross-validation.</p>`;
+ const tab=S.exTab||'cluster',tabs=`<div class="flex gap-2 mb-6">${[['cluster','Clustering'],['cv','Cross-validation']].map(([k,l])=>`<button class="btn ${tab===k?'btn-p':''}" onclick="S.exTab='${k}';render()">${l}</button>`).join('')}</div>`;
+ if(tab==='cv')return head+tabs+cvPanel();
+ if(!p)return head+tabs+`<div class="card p-10 text-center max-w-xl"><p class="text-sm mb-4" style="color:var(--dim)">Upload a CSV first, then come back here to find groups in it.</p><button class="btn btn-p" onclick="go('upload')">Upload dataset</button></div>`;
  const c=initCl();
  const cfg=`<div class="card p-6 mb-6"><div class="mb-4"><div class="font-semibold">${esc(p.name)}</div><div class="text-xs" style="color:var(--dim)">${fmt(p.rows)} rows · ${p.cols} columns</div></div>
   <label class="lbl">Columns to group by (${c.sel.size} selected)</label><div class="flex flex-wrap gap-2 mb-5">${p.columns.map((x,i)=>clChip(c.sel.has(x.n),x.n,`clToggleCol(${i})`,x.t)).join('')}</div>
@@ -951,7 +989,7 @@ function experimentsPage(){const p=S.profile;
   <p class="text-xs mt-3" style="color:var(--faint)">IDs, free-text and mostly-empty columns are skipped automatically. Big files are sampled to 3,000 rows for speed.</p>
   ${c.err?`<div class="mt-4 p-3 rounded-xl text-sm" style="background:rgba(248,113,113,.12);color:#f87171">${esc(c.err)}</div>`:''}</div>`;
  const hist=c.history.length?`<h2 class="text-base font-semibold mb-3">Runs this session</h2><div class="card overflow-x-auto mb-6"><table class="w-full min-w-[480px]"><thead><tr class="[&_th]:pt-4"><th>Time</th><th>Best algorithm</th><th>Clusters</th><th>Silhouette</th><th>Columns</th></tr></thead><tbody>${c.history.map(h=>`<tr><td class="mono">${new Date(h.at).toLocaleTimeString()}</td><td class="!text-white">${esc(h.algo)} <span class="mono" style="color:var(--dim)">${esc(h.param)}</span></td><td class="mono">${h.k}</td><td class="mono">${h.sil}</td><td class="mono">${h.cols}</td></tr>`).join('')}</tbody></table></div>`:'';
- return head+cfg+(c.res?clResults(c.res,c):'')+hist}
+ return head+tabs+cfg+(c.res?clResults(c.res,c):'')+hist}
 
 function placeholder(n){return `<div class="card p-12 text-center max-w-xl mx-auto mt-10"><div class="w-12 h-12 mx-auto rounded-xl flex items-center justify-center mb-4" style="background:rgba(99,102,241,.15);color:#a5b4fc">${ic('spark',22)}</div>
  <h2 class="text-lg font-semibold">${n}</h2><p class="text-sm mt-2 mb-5" style="color:var(--dim)">This section is not built yet. Start a new project to run the full pipeline.</p><button class="btn btn-p" onclick="go('upload')">${ic('plus',16)} New Project</button></div>`}
