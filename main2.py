@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.templating import Jinja2Templates
 import base64
@@ -591,7 +591,11 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 @app.get("/", response_class=HTMLResponse)
 async def landing_page():
     # public marketing page; the app itself lives at /app
-    return FileResponse(BASE_DIR / "templates" / "landing.html", media_type="text/html",
+    page = BASE_DIR / "templates" / "landing.html"
+    if not page.exists():      # landing.html was not deployed: open the app instead of showing a server error
+        print("WARNING: templates/landing.html not found, sending visitors to /app", file=sys.stderr)
+        return RedirectResponse("/app")
+    return FileResponse(page, media_type="text/html",
                         headers={"Cache-Control": "public, max-age=300"})
 
 
@@ -628,7 +632,7 @@ async def upload_file(file: UploadFile = File(...)):
         }
 
     df, profile = await run_in_threadpool(_parse)          # a big CSV must not freeze every other user
-    del content
+    content = None                                          # free the raw bytes early
 
     DATASET.clear()
     MODEL_STORE["bundle"] = None
@@ -695,6 +699,13 @@ def select_target(request: TargetRequest):
         problem_type = "classification" if target_data.nunique() <= 15 else "regression"
     else:
         raise HTTPException(400, "Unable to determine problem type.")
+
+    distinct = int(target_data.nunique())
+    if distinct < 2:
+        raise HTTPException(400, f"'{target}' has only one distinct value, so there is nothing to predict. Please choose another column.")
+    if problem_type == "classification" and distinct > 50:
+        raise HTTPException(400, f"'{target}' has {distinct} distinct text values, which is too many categories to predict. "
+                                 "Choose a column with fewer categories (like Pass/Fail), or a numeric column.")
 
     DATASET["target"] = target
     DATASET["problem_type"] = problem_type
@@ -1578,6 +1589,42 @@ def _submit_job(kind, fn):
 
     _EXEC.submit(runner)
     return _job_view(job)
+
+
+def _cross_validation_impl():
+    from sklearn.model_selection import cross_val_score,KFold
+    if DATASET["df"] is None:
+        raise HTTPException(400, "Please upload a CSV file first.")
+    if "target" not in DATASET:
+        raise HTTPException(400, "Please select target column first.")
+    if "X_train" not in DATASET:
+        raise HTTPException(400, "Please run preprocessing first.")
+    if DATASET["problem_type"] not in ("classification", "regression"):
+        raise HTTPException(400, "Cross-validation is only supported for classification or regression problems.")
+    if DATASET["problem_type"] == "classification":
+        if len(DATASET["y_train"].unique()) < 2:
+            raise HTTPException(400, "Cross-validation requires at least two classes in the target column.")
+        
+         
+    X, y = np.vstack([DATASET["X_train"], DATASET["X_test"]]), pd.concat([DATASET["y_train"], DATASET["y_test"]])
+    problem_type = DATASET["problem_type"]
+
+    if problem_type == "classification":
+        model = RandomForestClassifier(n_estimators=100, random_state=42)
+        scoring = "f1_weighted"
+    else:
+        model = RandomForestRegressor(n_estimators=100, random_state=42)
+        scoring = "r2"
+
+    scores = cross_val_score(model, X, y, cv=5, scoring=scoring)
+    return {
+        "message": "Cross-validation completed", "problem_type": problem_type,
+        "scoring": scoring, "scores": [round(float(s), 4) for s in scores],
+        "mean_score": round(float(scores.mean()), 4), "std_dev": round(float(scores.std()), 4)
+    }
+@app.router.post("/api/cross-validation")
+def start_cross_validation_job():
+    return _submit_job("cross-validation", _cross_validation_impl)
 
 
 @app.post("/api/jobs/train")
