@@ -446,7 +446,7 @@ function auth(){const su=S.auth==='signup',busy=S.authBusy;
  ${S.authErr?`<div class="text-xs p-2.5 rounded-lg" style="background:rgba(248,113,113,.12);color:#f87171">${S.authErr}</div>`:''}
  <button class="btn btn-p w-full" ${busy?'disabled':''}>${busy?ic('load',16,'spin'):(su?'Create account':'Sign in')}</button>
  <div class="flex items-center gap-3 text-xs" style="color:var(--faint)"><div class="flex-1 h-px" style="background:var(--line)"></div>OR<div class="flex-1 h-px" style="background:var(--line)"></div></div>
- <button type="button" class="btn w-full" ${busy?'disabled':''} onclick="googleAuth()"><b>G</b> Continue with Google</button></form>${demo}
+ </form>${demo}
  <p class="text-center text-sm mt-5" style="color:var(--dim)">${su?'Already have an account?':"Don't have an account?"} <a href="#" class="text-indigo-400 font-medium" onclick="event.preventDefault();S.auth='${su?'login':'signup'}';S.authErr='';render()">${su?'Sign in':'Create account'}</a></p></div></div>`}
 
 async function submitAuth(form,isSignup){
